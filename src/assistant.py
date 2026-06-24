@@ -33,6 +33,7 @@ class Assistant:
         client,
         model: str,
         transcript,
+        system_prompt: str | None = None,
         max_retries: int = 3,
         retry_wait_seconds: float = 2.0,
     ):
@@ -40,7 +41,10 @@ class Assistant:
         self._transcript = transcript
         self._max_retries = max_retries
         self._retry_wait = retry_wait_seconds
-        self._chat = client.chats.create(model=model)
+        chat_config = None
+        if system_prompt:
+            chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
+        self._chat = client.chats.create(model=model, config=chat_config)
 
     # ------------------------------------------------------------------
     # Public interface
