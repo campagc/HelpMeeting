@@ -3,7 +3,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 HOTKEY = "Control+Option+Space"
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
 AUDIO_CHUNK_SECONDS = 10
 MEETINGS_DIR = "meetings"
 SYSTEM_PROMPT_PATH = Path("system_prompt.md")

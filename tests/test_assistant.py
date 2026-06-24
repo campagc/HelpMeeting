@@ -57,7 +57,7 @@ class TestExplainSlide:
         chat = FakeChat(response_text="Here is the explanation.")
         client = FakeClient(chat)
         transcript = Transcript()
-        assistant = Assistant(client=client, model="gemini-2.0-flash", transcript=transcript)
+        assistant = Assistant(client=client, model="gemini-2.5-flash", transcript=transcript)
 
         result = assistant.explain_slide(image_bytes=b"\x89PNG", delta="speaker said hello")
 
@@ -73,7 +73,7 @@ class TestAskQuestion:
         chat = FakeChat(response_text="Good question, here is the answer.")
         client = FakeClient(chat)
         transcript = Transcript()
-        assistant = Assistant(client=client, model="gemini-2.0-flash", transcript=transcript)
+        assistant = Assistant(client=client, model="gemini-2.5-flash", transcript=transcript)
 
         result = assistant.ask_question(text="What does this mean?", delta="recent speech")
 
