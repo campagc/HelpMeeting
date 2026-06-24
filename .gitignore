@@ -1,2 +1,5 @@
 skills/
 .devin/
+.venv/
+__pycache__/
+*.pyc
