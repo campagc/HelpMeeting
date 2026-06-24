@@ -1,0 +1,12 @@
+[project]
+name = "helpmeeting"
+version = "0.1.0"
+description = "Semi-live meeting assistant for macOS"
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
