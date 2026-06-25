@@ -156,6 +156,25 @@ class TestChatSession:
         # All three calls went through the same FakeChat object
         assert len(chat.calls) == 3
 
+    def test_assistant_keeps_client_alive_after_caller_drops_it(self):
+        """The real genai client closes its transport in __del__; the Assistant
+        must keep it alive so worker-thread turns don't hit a closed client."""
+        import gc
+        import weakref
+
+        chat = FakeChat()
+        client = FakeClient(chat)
+        assistant = Assistant(client=client, model="m", transcript=Transcript())
+
+        client_ref = weakref.ref(client)
+        del client
+        gc.collect()
+
+        # The client must still be alive because the Assistant holds a reference.
+        assert client_ref() is not None
+        # And it can still be used.
+        assert assistant.explain_slide(image_bytes=b"PNG", delta="d") == "ok"
+
 
 # ---------------------------------------------------------------------------
 # explain_slide submits image bytes; ask_question does not

@@ -41,6 +41,9 @@ class Assistant:
         self._transcript = transcript
         self._max_retries = max_retries
         self._retry_wait = retry_wait_seconds
+        # Keep a reference to the client: the genai client closes its underlying
+        # httpx transport in __del__, so it must outlive this Assistant.
+        self._client = client
         chat_config = None
         if system_prompt:
             chat_config = types.GenerateContentConfig(system_instruction=system_prompt)
