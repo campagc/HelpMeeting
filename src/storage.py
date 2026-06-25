@@ -25,6 +25,11 @@ class Storage:
     # Public interface
     # ------------------------------------------------------------------
 
+    @property
+    def meeting_dir(self) -> Path | None:
+        """The current meeting folder, or None before start_meeting()."""
+        return self._meeting_dir
+
     def start_meeting(self, label: str, langs: list[str]) -> None:
         """Create meetings/<label>/ and write skeleton files."""
         self._meeting_dir = self._base_dir / "meetings" / label

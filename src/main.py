@@ -250,12 +250,16 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
 
     device_index = resolve_audio_device(sd.query_devices())
     output_fn(f"Capturing audio from device {device_index}: {sd.query_devices(device_index)['name']}")
+    audio_log = storage.meeting_dir / "audio_debug.log" if storage.meeting_dir else None
+    if audio_log is not None:
+        output_fn(f"Audio diagnostics: {audio_log}")
     audio_thread = AudioThread(
         transcript=transcript,
         storage=storage,
         chunk_seconds=config.audio_chunk_seconds,
         language=settings["spoken_language"],
         device=device_index,
+        log_path=audio_log,
     )
 
     session = MeetingSession(

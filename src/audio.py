@@ -42,6 +42,7 @@ class AudioThread:
         language: str = "en",
         device: int | str | None = 0,
         model_size: str = "small",
+        log_path=None,
     ):
         self._transcript = transcript
         self._storage = storage
@@ -49,11 +50,27 @@ class AudioThread:
         self._language = language
         self._device = device
         self._model_size = model_size
+        self._log_path = log_path
 
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run_with_restart, daemon=True, name="AudioThread"
         )
+
+    # ------------------------------------------------------------------
+    # Debug logging
+    # ------------------------------------------------------------------
+
+    def _log(self, message: str) -> None:
+        """Append a timestamped diagnostic line to the debug log (if configured)."""
+        if self._log_path is None:
+            return
+        try:
+            stamp = time.strftime("%H:%M:%S")
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{stamp}] {message}\n")
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Public interface
@@ -74,14 +91,22 @@ class AudioThread:
 
     def _run_with_restart(self) -> None:
         """Outer loop: if the inner capture loop raises, restart after a short delay."""
+        import traceback
+
+        self._log(
+            f"thread start | device={self._device} model={self._model_size} "
+            f"chunk_seconds={self._chunk_seconds} language={self._language}"
+        )
         while not self._stop_event.is_set():
             try:
                 self._capture_loop()
             except Exception as exc:  # noqa: BLE001
                 if self._stop_event.is_set():
                     break
+                self._log("capture loop crashed:\n" + traceback.format_exc())
                 print(f"[AudioThread] error — restarting in 2 s: {exc}")
                 time.sleep(2)
+        self._log("thread exit")
 
     # ------------------------------------------------------------------
     # Inner capture + transcription loop
@@ -90,7 +115,9 @@ class AudioThread:
     def _capture_loop(self) -> None:
         """Load the Whisper model once, open the audio stream, and transcribe
         each complete ~chunk_seconds window until _stop_event is set."""
+        self._log("loading Whisper model…")
         model = WhisperModel(self._model_size, device="cpu", compute_type="int8")
+        self._log("Whisper model loaded")
 
         frames_per_chunk = _SAMPLE_RATE * self._chunk_seconds
         audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
@@ -98,9 +125,15 @@ class AudioThread:
         accumulated_frames = 0
         silent_chunks = 0
         warned_silent = False
+        callback_count = 0
+        chunk_count = 0
 
         def _callback(indata: np.ndarray, frames: int, time_info, status) -> None:
             """PortAudio callback — runs in a separate C thread."""
+            nonlocal callback_count
+            callback_count += 1
+            if status:
+                self._log(f"stream status flag: {status}")
             chunk = indata[:, 0].copy()  # flatten to mono
             audio_queue.put(chunk)
 
@@ -112,6 +145,10 @@ class AudioThread:
             blocksize=_CALLBACK_BLOCK,
             callback=_callback,
         ):
+            self._log(
+                f"InputStream open (samplerate={_SAMPLE_RATE} channels={_CHANNELS} "
+                f"blocksize={_CALLBACK_BLOCK}); waiting for audio…"
+            )
             while not self._stop_event.is_set():
                 try:
                     block = audio_queue.get(timeout=0.5)
@@ -125,13 +162,22 @@ class AudioThread:
                     audio_chunk = np.concatenate(accumulator)
                     accumulator = []
                     accumulated_frames = 0
+                    chunk_count += 1
+
+                    rms = float(np.sqrt(np.mean(audio_chunk ** 2)))
+                    peak = float(np.max(np.abs(audio_chunk)))
+                    self._log(
+                        f"chunk #{chunk_count}: frames={len(audio_chunk)} "
+                        f"rms={rms:.6f} peak={peak:.6f} callbacks_so_far={callback_count}"
+                    )
 
                     # Warn once if the meeting audio is not reaching us — a common
                     # setup mistake (system output not routed into BlackHole).
-                    if float(np.sqrt(np.mean(audio_chunk ** 2))) < _SILENCE_RMS:
+                    if rms < _SILENCE_RMS:
                         silent_chunks += 1
                         if silent_chunks >= _SILENCE_WARN_AFTER and not warned_silent:
                             warned_silent = True
+                            self._log("SILENCE detected — audio is not reaching the device")
                             print(
                                 "[AudioThread] No audio detected on the capture device. "
                                 "Is your system output routed to BlackHole "
@@ -142,6 +188,7 @@ class AudioThread:
                     warned_silent = False
 
                     text = self._transcribe(model, audio_chunk)
+                    self._log(f"chunk #{chunk_count} transcribed: {len(text)} chars: {text[:80]!r}")
                     if text:
                         self._transcript.append(text)
                         self._storage.append_transcript(text)
