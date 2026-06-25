@@ -259,6 +259,7 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
         chunk_seconds=config.audio_chunk_seconds,
         language=settings["spoken_language"],
         device=device_index,
+        model_size=config.whisper_model_size,
         log_path=audio_log,
     )
 

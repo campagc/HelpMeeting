@@ -62,10 +62,12 @@ def main():
         )
         return 1
 
-    print("\nSignal detected. Transcribing with faster-whisper (small)…")
+    from src.config import WHISPER_MODEL_SIZE
+
+    print(f"\nSignal detected. Transcribing with faster-whisper ({WHISPER_MODEL_SIZE})…")
     from faster_whisper import WhisperModel
 
-    model = WhisperModel("small", device="cpu", compute_type="int8")
+    model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
     segments, _info = model.transcribe(audio, language="en", beam_size=5, vad_filter=False)
     text = " ".join(seg.text.strip() for seg in segments).strip()
 

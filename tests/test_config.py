@@ -15,6 +15,8 @@ class TestConfig:
         assert config.api_key == "test-key"
         assert config.system_prompt == "You are a helpful assistant."
         assert config.hotkey == "Control+Option+Space"
+        # base downloads reliably and runs fast on CPU
+        assert config.whisper_model_size == "base"
 
     def test_load_raises_clear_error_when_api_key_missing(self, tmp_path, monkeypatch):
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
