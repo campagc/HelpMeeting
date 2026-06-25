@@ -4,3 +4,5 @@ skills/
 __pycache__/
 *.pyc
 .env
+.vscode/
+meetings/
