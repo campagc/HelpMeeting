@@ -25,6 +25,8 @@ from faster_whisper import WhisperModel
 _SAMPLE_RATE = 16_000       # Hz — Whisper expects 16 kHz mono
 _CHANNELS = 1
 _CALLBACK_BLOCK = 1024      # frames per PortAudio callback invocation
+_SILENCE_RMS = 1e-4         # below this a chunk is treated as silence
+_SILENCE_WARN_AFTER = 2     # warn after this many consecutive silent chunks
 
 
 class AudioThread:
@@ -94,6 +96,8 @@ class AudioThread:
         audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         accumulator: list[np.ndarray] = []
         accumulated_frames = 0
+        silent_chunks = 0
+        warned_silent = False
 
         def _callback(indata: np.ndarray, frames: int, time_info, status) -> None:
             """PortAudio callback — runs in a separate C thread."""
@@ -121,6 +125,22 @@ class AudioThread:
                     audio_chunk = np.concatenate(accumulator)
                     accumulator = []
                     accumulated_frames = 0
+
+                    # Warn once if the meeting audio is not reaching us — a common
+                    # setup mistake (system output not routed into BlackHole).
+                    if float(np.sqrt(np.mean(audio_chunk ** 2))) < _SILENCE_RMS:
+                        silent_chunks += 1
+                        if silent_chunks >= _SILENCE_WARN_AFTER and not warned_silent:
+                            warned_silent = True
+                            print(
+                                "[AudioThread] No audio detected on the capture device. "
+                                "Is your system output routed to BlackHole "
+                                "(e.g. via a Multi-Output Device)?"
+                            )
+                        continue
+                    silent_chunks = 0
+                    warned_silent = False
+
                     text = self._transcribe(model, audio_chunk)
                     if text:
                         self._transcript.append(text)

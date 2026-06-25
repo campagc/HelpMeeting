@@ -356,6 +356,36 @@ class TestShutdown:
         turns = json.loads(history_path.read_text())
         assert turns == []
 
+    def test_stop_finalizes_even_if_audio_flush_fails(self, tmp_path):
+        """A slow/failing final audio flush (or an impatient second Ctrl+C)
+        must not prevent history.json from being finalized."""
+        class ExplodingAudioThread(FakeAudioThread):
+            def stop(self):
+                self.stopped = True
+                raise KeyboardInterrupt()
+
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        audio_thread = ExplodingAudioThread()
+        capture = FakeCapture()
+
+        session = MeetingSession(
+            transcript=Transcript(),
+            storage=storage,
+            assistant=FakeAssistant(),
+            audio_thread=audio_thread,
+            capture=capture,
+            input_fn=lambda _: "",
+            output_fn=lambda _: None,
+        )
+        session.start()
+        session.on_question("recorded before shutdown")
+        session.stop()  # must not raise
+
+        history_path = tmp_path / "meetings" / "test-meeting" / "history.json"
+        turns = json.loads(history_path.read_text())
+        assert len(turns) == 2  # the question turn was recorded and finalized
+
 
 class TestMain:
     def test_main_prints_ready_when_config_loads(self, tmp_path, monkeypatch, capsys):

@@ -110,15 +110,37 @@ class MeetingSession:
         self._worker_thread.start()
 
     def stop(self) -> None:
-        """Signal shutdown, finish queued turns, stop threads, and finalize storage."""
+        """Signal shutdown, finish queued turns, finalize storage, then stop threads.
+
+        Finalization happens before the (potentially slow) final audio flush so
+        that history.json is always written, even if the flush is interrupted by
+        an impatient second Ctrl+C.
+        """
         self._shutdown.set()
-        self._capture.stop()
+        self._quietly(self._capture.stop)
+
+        # Let any in-flight or queued turn finish and be recorded.
         self._task_queue.put(None)
-        self._worker_thread.join()
-        self._audio_thread.stop()
-        self._storage.finalize()
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=30.0)
+
+        # Critical: persist the machine-readable history before slow cleanup.
+        self._quietly(self._storage.finalize)
+
+        # Best-effort: flush the final transcript chunk; may be slow.
+        self._quietly(self._audio_thread.stop)
+
         if self._capture_thread is not None:
-            self._capture_thread.join(timeout=1.0)
+            self._quietly(lambda: self._capture_thread.join(timeout=1.0))
+
+    @staticmethod
+    def _quietly(func) -> None:
+        """Run a shutdown step, swallowing errors and stray KeyboardInterrupts so
+        one failing step never aborts the rest of finalization."""
+        try:
+            func()
+        except (Exception, KeyboardInterrupt):  # noqa: BLE001
+            pass
 
     def run_input_loop(self) -> None:
         """Read questions from the terminal until Ctrl+C or EOF."""
@@ -273,7 +295,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        print("\nShutting down and saving the meeting…")
         session.stop()
+        print("Done.")
     return 0
 
 
