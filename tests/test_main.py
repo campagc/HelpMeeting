@@ -1,8 +1,40 @@
 import json
 
-from src.main import main, prompt_settings, MeetingSession
+import pytest
+
+from src.main import main, prompt_settings, MeetingSession, resolve_audio_device
 from src.storage import Storage
 from src.transcript import Transcript
+
+
+class TestResolveAudioDevice:
+    """The meeting audio comes from BlackHole; we must find it by name because
+    device indices shift whenever other audio devices connect/disconnect."""
+
+    DEVICES = [
+        {"name": "iPhone di Giuliano Microphone", "max_input_channels": 1},
+        {"name": "BlackHole 2ch", "max_input_channels": 2},
+        {"name": "MacBook Air Microphone", "max_input_channels": 1},
+        {"name": "MacBook Air Speakers", "max_input_channels": 0},
+    ]
+
+    def test_finds_blackhole_by_name_not_index_zero(self):
+        assert resolve_audio_device(self.DEVICES) == 1
+
+    def test_match_is_case_insensitive_and_substring(self):
+        devices = [
+            {"name": "Some Mic", "max_input_channels": 1},
+            {"name": "blackhole 16ch", "max_input_channels": 16},
+        ]
+        assert resolve_audio_device(devices) == 1
+
+    def test_raises_clear_error_when_blackhole_absent(self):
+        devices = [
+            {"name": "MacBook Air Microphone", "max_input_channels": 1},
+            {"name": "MacBook Air Speakers", "max_input_channels": 0},
+        ]
+        with pytest.raises(RuntimeError, match="BlackHole"):
+            resolve_audio_device(devices)
 
 
 class TestPromptSettings:
@@ -273,6 +305,33 @@ class TestShutdown:
         history_path = tmp_path / "meetings" / "test-meeting" / "history.json"
         turns = json.loads(history_path.read_text())
         assert len(turns) == 2
+
+    def test_input_loop_exits_on_keyboard_interrupt(self, tmp_path):
+        """Ctrl+C while blocked on input() raises KeyboardInterrupt; the loop
+        must exit promptly instead of waiting for the user to press Enter."""
+        def fake_input(prompt=""):
+            raise KeyboardInterrupt()
+
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        audio_thread = FakeAudioThread()
+        capture = FakeCapture()
+
+        session = MeetingSession(
+            transcript=Transcript(),
+            storage=storage,
+            assistant=FakeAssistant(),
+            audio_thread=audio_thread,
+            capture=capture,
+            input_fn=fake_input,
+            output_fn=lambda _: None,
+        )
+        session.start()
+        session.run_input_loop()  # must return, not propagate KeyboardInterrupt
+        session.stop()
+
+        assert audio_thread.stopped is True
+        assert capture.stopped is True
 
     def test_stop_finalizes_even_with_no_turns(self, tmp_path):
         storage = Storage(base_dir=tmp_path)

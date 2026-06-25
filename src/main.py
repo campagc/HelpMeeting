@@ -121,12 +121,12 @@ class MeetingSession:
             self._capture_thread.join(timeout=1.0)
 
     def run_input_loop(self) -> None:
-        """Read questions from the terminal until shutdown or EOF."""
+        """Read questions from the terminal until Ctrl+C or EOF."""
         self._safe_print("Type a question and press Enter, or press Ctrl+C to stop.")
         while not self._shutdown.is_set():
             try:
                 question = self._input_fn("Question: ")
-            except EOFError:
+            except (EOFError, KeyboardInterrupt):
                 break
             if self._shutdown.is_set():
                 break
@@ -183,8 +183,29 @@ class MeetingSession:
             self._output_fn(message)
 
 
+_AUDIO_DEVICE_NAME = "BlackHole"
+
+
+def resolve_audio_device(devices, preferred_name: str = _AUDIO_DEVICE_NAME) -> int:
+    """Return the index of the input device whose name contains preferred_name.
+
+    System audio is captured via BlackHole, but device indices shift whenever
+    other devices connect/disconnect, so we must match by name rather than a
+    fixed index.
+    """
+    for index, device in enumerate(devices):
+        if preferred_name.lower() in device["name"].lower():
+            return index
+    raise RuntimeError(
+        f"No '{preferred_name}' audio device found. Install BlackHole and route "
+        f"system audio through a Multi-Output Device. Available devices: "
+        f"{[d['name'] for d in devices]}"
+    )
+
+
 def _build_session(config, settings, *, input_fn=input, output_fn=print):
     """Wire the real dependencies into a MeetingSession."""
+    import sounddevice as sd
     from google import genai
 
     from src.audio import AudioThread
@@ -205,12 +226,14 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
         system_prompt=config.system_prompt,
     )
 
+    device_index = resolve_audio_device(sd.query_devices())
+    output_fn(f"Capturing audio from device {device_index}: {sd.query_devices(device_index)['name']}")
     audio_thread = AudioThread(
         transcript=transcript,
         storage=storage,
         chunk_seconds=config.audio_chunk_seconds,
         language=settings["spoken_language"],
-        device=0,
+        device=device_index,
     )
 
     session = MeetingSession(
@@ -228,8 +251,6 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
 
 
 def main():
-    import signal
-
     try:
         config = load()
     except MissingApiKeyError as exc:
@@ -244,11 +265,8 @@ def main():
     print(f"  display: {settings['monitor_index']}")
     print(f"Press {config.hotkey} to request an explanation, Ctrl+C to stop.")
 
-    def _handle_sigint(signum, frame):
-        session._shutdown.set()
-
-    signal.signal(signal.SIGINT, _handle_sigint)
-
+    # Rely on the default SIGINT handler: Ctrl+C raises KeyboardInterrupt into
+    # the blocking input() call, which run_input_loop catches to exit cleanly.
     session.start()
     try:
         session.run_input_loop()
