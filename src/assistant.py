@@ -4,9 +4,10 @@ Two turn types share the same chat session:
 - explain_slide(image_bytes, delta) -> str
 - ask_question(text, delta)         -> str
 
-Both accept a pre-consumed transcript delta (caller calls transcript.take_delta()
-before passing it in).  Failure is handled with retry + backoff; persistent
-failure returns a graceful inline message and never raises.
+Both accept a pre-consumed transcript delta as a plain string argument.
+Delta management (calling transcript.take_delta()) is the caller's responsibility.
+Failure is handled with retry + backoff; persistent failure returns a graceful
+inline message and never raises.
 """
 import time
 
@@ -32,13 +33,11 @@ class Assistant:
         *,
         client,
         model: str,
-        transcript,
         system_prompt: str | None = None,
         max_retries: int = 3,
         retry_wait_seconds: float = 2.0,
     ):
         self._model = model
-        self._transcript = transcript
         self._max_retries = max_retries
         self._retry_wait = retry_wait_seconds
         # Keep a reference to the client: the genai client closes its underlying

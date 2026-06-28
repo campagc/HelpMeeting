@@ -3,8 +3,23 @@ import json
 import pytest
 
 from src.main import main, prompt_settings, MeetingSession, resolve_audio_device
+from src.conversation import Conversation
 from src.storage import Storage
 from src.transcript import Transcript
+
+
+def _make_session(*, transcript, storage, assistant, audio_thread, capture,
+                  input_fn=lambda _: "", output_fn=lambda _: None):
+    """Wire a MeetingSession around a real Conversation, mirroring _build_session."""
+    conversation = Conversation(transcript=transcript, storage=storage, assistant=assistant)
+    return MeetingSession(
+        conversation=conversation,
+        storage=storage,
+        audio_thread=audio_thread,
+        capture=capture,
+        input_fn=input_fn,
+        output_fn=output_fn,
+    )
 
 
 class TestResolveAudioDevice:
@@ -166,13 +181,12 @@ class TestHotkeyCallback:
         capture = FakeCapture()
         outputs = []
 
-        session = MeetingSession(
+        session = _make_session(
             transcript=transcript,
             storage=storage,
             assistant=assistant,
             audio_thread=audio_thread,
             capture=capture,
-            input_fn=lambda _: "",
             output_fn=outputs.append,
         )
         session.start()
@@ -201,13 +215,12 @@ class TestQuestionCallback:
         capture = FakeCapture()
         outputs = []
 
-        session = MeetingSession(
+        session = _make_session(
             transcript=transcript,
             storage=storage,
             assistant=assistant,
             audio_thread=audio_thread,
             capture=capture,
-            input_fn=lambda _: "",
             output_fn=outputs.append,
         )
         session.start()
@@ -243,13 +256,12 @@ class TestAIFailure:
         capture = FakeCapture()
         outputs = []
 
-        session = MeetingSession(
+        session = _make_session(
             transcript=transcript,
             storage=storage,
             assistant=assistant,
             audio_thread=audio_thread,
             capture=capture,
-            input_fn=lambda _: "",
             output_fn=outputs.append,
         )
         session.start()
@@ -286,7 +298,7 @@ class TestShutdown:
         capture = FakeCapture()
         outputs = []
 
-        session = MeetingSession(
+        session = _make_session(
             transcript=transcript,
             storage=storage,
             assistant=assistant,
@@ -317,14 +329,13 @@ class TestShutdown:
         audio_thread = FakeAudioThread()
         capture = FakeCapture()
 
-        session = MeetingSession(
+        session = _make_session(
             transcript=Transcript(),
             storage=storage,
             assistant=FakeAssistant(),
             audio_thread=audio_thread,
             capture=capture,
             input_fn=fake_input,
-            output_fn=lambda _: None,
         )
         session.start()
         session.run_input_loop()  # must return, not propagate KeyboardInterrupt
@@ -340,14 +351,12 @@ class TestShutdown:
         capture = FakeCapture()
         transcript = Transcript()
 
-        session = MeetingSession(
+        session = _make_session(
             transcript=transcript,
             storage=storage,
             assistant=FakeAssistant(),
             audio_thread=audio_thread,
             capture=capture,
-            input_fn=lambda _: "",
-            output_fn=lambda _: None,
         )
         session.start()
         session.stop()
@@ -369,14 +378,12 @@ class TestShutdown:
         audio_thread = ExplodingAudioThread()
         capture = FakeCapture()
 
-        session = MeetingSession(
+        session = _make_session(
             transcript=Transcript(),
             storage=storage,
             assistant=FakeAssistant(),
             audio_thread=audio_thread,
             capture=capture,
-            input_fn=lambda _: "",
-            output_fn=lambda _: None,
         )
         session.start()
         session.on_question("recorded before shutdown")

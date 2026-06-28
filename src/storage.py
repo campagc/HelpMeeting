@@ -6,7 +6,7 @@ storage = Storage(base_dir=Path("."))
 storage.start_meeting(label, langs)
 path   = storage.save_slide(image_bytes)
 storage.append_transcript(text)
-storage.record_turn(role, content, explanation, slide_path=None)
+storage.record_turn(role, content, slide_path=None)
 storage.finalize()
 """
 
@@ -68,13 +68,12 @@ class Storage:
         self,
         role: str,
         content: str,
-        explanation: str,
         slide_path: str | None = None,
     ) -> None:
         """Append a turn to history.json and session.md."""
         self._assert_started()
 
-        turn: dict = {"role": role, "content": content, "explanation": explanation}
+        turn: dict = {"role": role, "content": content}
         if slide_path is not None:
             turn["slide_path"] = slide_path
 
@@ -106,15 +105,12 @@ class Storage:
     def _append_session_md(self, turn: dict) -> None:
         role = turn["role"].capitalize()
         content = turn["content"]
-        explanation = turn.get("explanation", "")
         slide_path = turn.get("slide_path")
 
         lines = [f"## {role}\n"]
         if slide_path:
             lines.append(f"![slide]({slide_path})\n\n")
         lines.append(f"{content}\n")
-        if explanation:
-            lines.append(f"\n_{explanation}_\n")
         lines.append("\n")
 
         with (self._meeting_dir / "session.md").open("a", encoding="utf-8") as f:

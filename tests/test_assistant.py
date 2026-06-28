@@ -56,8 +56,7 @@ class TestExplainSlide:
     def test_explain_slide_returns_model_text(self):
         chat = FakeChat(response_text="Here is the explanation.")
         client = FakeClient(chat)
-        transcript = Transcript()
-        assistant = Assistant(client=client, model="gemini-2.5-flash", transcript=transcript)
+        assistant = Assistant(client=client, model="gemini-2.5-flash")
 
         result = assistant.explain_slide(image_bytes=b"\x89PNG", delta="speaker said hello")
 
@@ -72,8 +71,7 @@ class TestAskQuestion:
     def test_ask_question_returns_model_text(self):
         chat = FakeChat(response_text="Good question, here is the answer.")
         client = FakeClient(chat)
-        transcript = Transcript()
-        assistant = Assistant(client=client, model="gemini-2.5-flash", transcript=transcript)
+        assistant = Assistant(client=client, model="gemini-2.5-flash")
 
         result = assistant.ask_question(text="What does this mean?", delta="recent speech")
 
@@ -90,7 +88,7 @@ class TestTranscriptPointer:
         transcript = Transcript()
         transcript.append("chunk one")
         transcript.append("chunk two")
-        assistant = Assistant(client=FakeClient(chat), model="m", transcript=transcript)
+        assistant = Assistant(client=FakeClient(chat), model="m")
 
         assistant.explain_slide(image_bytes=b"PNG", delta=transcript.take_delta())
 
@@ -102,7 +100,7 @@ class TestTranscriptPointer:
         chat = FakeChat()
         transcript = Transcript()
         transcript.append("new speech")
-        assistant = Assistant(client=FakeClient(chat), model="m", transcript=transcript)
+        assistant = Assistant(client=FakeClient(chat), model="m")
 
         assistant.ask_question(text="question", delta=transcript.take_delta())
 
@@ -111,7 +109,7 @@ class TestTranscriptPointer:
     def test_consecutive_explain_slides_do_not_repeat_delta(self):
         chat = FakeChat()
         transcript = Transcript()
-        assistant = Assistant(client=FakeClient(chat), model="m", transcript=transcript)
+        assistant = Assistant(client=FakeClient(chat), model="m")
 
         transcript.append("first chunk")
         first_delta = transcript.take_delta()
@@ -146,8 +144,7 @@ class TestChatSession:
     def test_single_chat_session_reused_across_turns(self):
         chat = FakeChat()
         client = FakeClient(chat)
-        transcript = Transcript()
-        assistant = Assistant(client=client, model="m", transcript=transcript)
+        assistant = Assistant(client=client, model="m")
 
         assistant.explain_slide(image_bytes=b"PNG1", delta="delta1")
         assistant.explain_slide(image_bytes=b"PNG2", delta="delta2")
@@ -164,7 +161,7 @@ class TestChatSession:
 
         chat = FakeChat()
         client = FakeClient(chat)
-        assistant = Assistant(client=client, model="m", transcript=Transcript())
+        assistant = Assistant(client=client, model="m")
 
         client_ref = weakref.ref(client)
         del client
@@ -188,7 +185,7 @@ class TestTurnContent:
 
     def test_explain_slide_sends_image_part(self):
         chat = FakeChat()
-        assistant = Assistant(client=FakeClient(chat), model="m", transcript=Transcript())
+        assistant = Assistant(client=FakeClient(chat), model="m")
 
         assistant.explain_slide(image_bytes=b"\x89PNG\r\n\x1a\n", delta="text")
 
@@ -197,7 +194,7 @@ class TestTurnContent:
 
     def test_ask_question_sends_no_image_part(self):
         chat = FakeChat()
-        assistant = Assistant(client=FakeClient(chat), model="m", transcript=Transcript())
+        assistant = Assistant(client=FakeClient(chat), model="m")
 
         assistant.ask_question(text="What is this?", delta="text")
 
@@ -241,7 +238,6 @@ class TestRetry:
         assistant = Assistant(
             client=FakeClient(chat),
             model="m",
-            transcript=Transcript(),
             max_retries=3,
             retry_wait_seconds=0,
         )
@@ -262,7 +258,6 @@ class TestRetry:
         assistant = Assistant(
             client=AlwaysFailClient(),
             model="m",
-            transcript=Transcript(),
             max_retries=2,
             retry_wait_seconds=0,
         )

@@ -101,20 +101,19 @@ class TestStorage:
         storage = Storage(base_dir=tmp_path)
         storage.start_meeting("2026-06-25_14-00_standup", langs=["en"])
 
-        storage.record_turn(role="assistant", content="Slide 1 shows…", explanation="This is the intro slide.")
+        storage.record_turn(role="assistant", content="Slide 1 shows…")
 
         history_path = tmp_path / "meetings" / "2026-06-25_14-00_standup" / "history.json"
         turns = json.loads(history_path.read_text())
         assert len(turns) == 1
         assert turns[0]["role"] == "assistant"
         assert turns[0]["content"] == "Slide 1 shows…"
-        assert turns[0]["explanation"] == "This is the intro slide."
 
     def test_record_turn_appends_to_session_md(self, tmp_path):
         storage = Storage(base_dir=tmp_path)
         storage.start_meeting("2026-06-25_14-00_standup", langs=["en"])
 
-        storage.record_turn(role="assistant", content="Some explanation", explanation="This is the intro slide.")
+        storage.record_turn(role="assistant", content="Some explanation")
 
         session = (tmp_path / "meetings" / "2026-06-25_14-00_standup" / "session.md").read_text()
         assert "Some explanation" in session
@@ -123,8 +122,8 @@ class TestStorage:
         storage = Storage(base_dir=tmp_path)
         storage.start_meeting("2026-06-25_14-00_standup", langs=["en"])
 
-        storage.record_turn(role="user", content="What is this?", explanation="")
-        storage.record_turn(role="assistant", content="It's a chart.", explanation="Revenue chart Q1.")
+        storage.record_turn(role="user", content="What is this?")
+        storage.record_turn(role="assistant", content="It's a chart.")
 
         history_path = tmp_path / "meetings" / "2026-06-25_14-00_standup" / "history.json"
         turns = json.loads(history_path.read_text())
@@ -140,7 +139,6 @@ class TestStorage:
         storage.record_turn(
             role="assistant",
             content="See attached slide",
-            explanation="Revenue chart.",
             slide_path=slide_path,
         )
 
@@ -156,7 +154,6 @@ class TestStorage:
         storage.record_turn(
             role="assistant",
             content="See attached slide",
-            explanation="Revenue chart.",
             slide_path=slide_path,
         )
 
@@ -173,7 +170,7 @@ class TestStorage:
         storage = Storage(base_dir=tmp_path)
         storage.start_meeting("2026-06-25_14-00_standup", langs=["en"])
         storage.append_transcript("some text")
-        storage.record_turn(role="assistant", content="OK", explanation="Fine.")
+        storage.record_turn(role="assistant", content="OK")
 
         storage.finalize()
 
@@ -186,8 +183,8 @@ class TestStorage:
         """history.json must contain enough fields to reconstruct the chat."""
         storage = Storage(base_dir=tmp_path)
         storage.start_meeting("2026-06-25_14-00_standup", langs=["en"])
-        storage.record_turn(role="user", content="Hello", explanation="")
-        storage.record_turn(role="assistant", content="Hi there", explanation="Greeting.")
+        storage.record_turn(role="user", content="Hello")
+        storage.record_turn(role="assistant", content="Hi there")
 
         storage.finalize()
 

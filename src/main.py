@@ -67,27 +67,27 @@ def prompt_settings(input_fn=input, output_fn=print, list_monitors_fn=_list_moni
 
 
 class MeetingSession:
-    """Wires the audio, capture, assistant, and storage modules into the live loop.
+    """Wires the conversation, audio, capture, and storage modules into the live loop.
 
     The capture object must be pre-configured with its own callback pointing at
     ``on_hotkey``.  This class owns the threads: audio transcription, capture
     listener, and the assistant worker that processes hotkey / question turns.
+    Each queued turn is run through the ``conversation`` module, which owns the
+    turn's steps and their ordering.
     """
 
     def __init__(
         self,
         *,
-        transcript,
+        conversation,
         storage,
-        assistant,
         audio_thread,
         capture,
         input_fn=input,
         output_fn=print,
     ):
-        self._transcript = transcript
+        self._conversation = conversation
         self._storage = storage
-        self._assistant = assistant
         self._audio_thread = audio_thread
         self._capture = capture
         self._input_fn = input_fn
@@ -182,23 +182,12 @@ class MeetingSession:
                 self._safe_print(f"[Error processing turn: {exc}]")
 
     def _do_explain(self, png_bytes: bytes) -> None:
-        delta = self._transcript.take_delta()
-        slide_path = self._storage.save_slide(png_bytes)
-        explanation = self._assistant.explain_slide(image_bytes=png_bytes, delta=delta)
+        explanation = self._conversation.explain(png_bytes)
         self._safe_print(f"\n[Explanation]\n{explanation}\n")
-        self._storage.record_turn(
-            role="assistant",
-            content=explanation,
-            explanation="",
-            slide_path=slide_path,
-        )
 
     def _do_question(self, question: str) -> None:
-        delta = self._transcript.take_delta()
-        self._storage.record_turn(role="user", content=question, explanation="")
-        answer = self._assistant.ask_question(text=question, delta=delta)
+        answer = self._conversation.ask(question)
         self._safe_print(f"\n[Answer]\n{answer}\n")
-        self._storage.record_turn(role="assistant", content=answer, explanation="")
 
     def _safe_print(self, message: str) -> None:
         with self._print_lock:
@@ -233,6 +222,7 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
     from src.audio import AudioThread
     from src.assistant import Assistant
     from src.capture import Capture
+    from src.conversation import Conversation
     from src.storage import Storage
     from src.transcript import Transcript
 
@@ -244,7 +234,6 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
     assistant = Assistant(
         client=client,
         model=config.gemini_model_name,
-        transcript=transcript,
         system_prompt=config.system_prompt,
     )
 
@@ -263,10 +252,11 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
         log_path=audio_log,
     )
 
+    conversation = Conversation(transcript=transcript, storage=storage, assistant=assistant)
+
     session = MeetingSession(
-        transcript=transcript,
+        conversation=conversation,
         storage=storage,
-        assistant=assistant,
         audio_thread=audio_thread,
         capture=None,  # set below after wiring the hotkey callback
         input_fn=input_fn,

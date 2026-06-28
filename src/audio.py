@@ -17,6 +17,7 @@ thread.stop()    # signals the thread to finish and joins it
 import queue
 import threading
 import time
+from typing import Protocol
 
 import numpy as np
 import sounddevice as sd
@@ -27,6 +28,39 @@ _CHANNELS = 1
 _CALLBACK_BLOCK = 1024      # frames per PortAudio callback invocation
 _SILENCE_RMS = 1e-4         # below this a chunk is treated as silence
 _SILENCE_WARN_AFTER = 2     # warn after this many consecutive silent chunks
+
+
+class Transcriber(Protocol):
+    """Converts a 1-D float32 audio array into a transcript string."""
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        """Transcribe audio; return combined text or empty string."""
+        ...
+
+
+class WhisperTranscriber:
+    """Concrete Transcriber backed by faster-whisper.WhisperModel.
+
+    The model is loaded eagerly in __init__ so failures are reported at
+    startup (matching the original _capture_loop behaviour).
+    """
+
+    def __init__(self, model_size: str, language: str, log_fn=None) -> None:
+        self._language = language
+        _log = log_fn or (lambda _: None)
+        _log("loading Whisper model…")
+        self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        _log("Whisper model loaded")
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        """Transcribe a 1-D float32 numpy array; return combined text or empty string."""
+        segments, _info = self._model.transcribe(
+            audio,
+            language=self._language,
+            beam_size=5,
+            vad_filter=False,
+        )
+        return " ".join(seg.text.strip() for seg in segments).strip()
 
 
 class AudioThread:
@@ -43,6 +77,7 @@ class AudioThread:
         device: int | str | None = 0,
         model_size: str = "small",
         log_path=None,
+        transcriber: Transcriber | None = None,
     ):
         self._transcript = transcript
         self._storage = storage
@@ -51,6 +86,7 @@ class AudioThread:
         self._device = device
         self._model_size = model_size
         self._log_path = log_path
+        self._transcriber = transcriber
 
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -113,20 +149,18 @@ class AudioThread:
     # ------------------------------------------------------------------
 
     def _capture_loop(self) -> None:
-        """Load the Whisper model once, open the audio stream, and transcribe
-        each complete ~chunk_seconds window until _stop_event is set."""
-        self._log("loading Whisper model…")
-        model = WhisperModel(self._model_size, device="cpu", compute_type="int8")
-        self._log("Whisper model loaded")
+        """Open the audio stream and transcribe each complete ~chunk_seconds window
+        until _stop_event is set."""
+        transcriber = self._transcriber
+        if transcriber is None:
+            transcriber = WhisperTranscriber(
+                model_size=self._model_size,
+                language=self._language,
+                log_fn=self._log,
+            )
 
-        frames_per_chunk = _SAMPLE_RATE * self._chunk_seconds
-        audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
-        accumulator: list[np.ndarray] = []
-        accumulated_frames = 0
-        silent_chunks = 0
-        warned_silent = False
+        audio_queue: queue.Queue[np.ndarray] = queue.Queue()
         callback_count = 0
-        chunk_count = 0
 
         def _callback(indata: np.ndarray, frames: int, time_info, status) -> None:
             """PortAudio callback — runs in a separate C thread."""
@@ -149,68 +183,79 @@ class AudioThread:
                 f"InputStream open (samplerate={_SAMPLE_RATE} channels={_CHANNELS} "
                 f"blocksize={_CALLBACK_BLOCK}); waiting for audio…"
             )
-            while not self._stop_event.is_set():
-                try:
-                    block = audio_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-
-                accumulator.append(block)
-                accumulated_frames += len(block)
-
-                if accumulated_frames >= frames_per_chunk:
-                    audio_chunk = np.concatenate(accumulator)
-                    accumulator = []
-                    accumulated_frames = 0
-                    chunk_count += 1
-
-                    rms = float(np.sqrt(np.mean(audio_chunk ** 2)))
-                    peak = float(np.max(np.abs(audio_chunk)))
-                    self._log(
-                        f"chunk #{chunk_count}: frames={len(audio_chunk)} "
-                        f"rms={rms:.6f} peak={peak:.6f} callbacks_so_far={callback_count}"
-                    )
-
-                    # Warn once if the meeting audio is not reaching us — a common
-                    # setup mistake (system output not routed into BlackHole).
-                    if rms < _SILENCE_RMS:
-                        silent_chunks += 1
-                        if silent_chunks >= _SILENCE_WARN_AFTER and not warned_silent:
-                            warned_silent = True
-                            self._log("SILENCE detected — audio is not reaching the device")
-                            print(
-                                "[AudioThread] No audio detected on the capture device. "
-                                "Is your system output routed to BlackHole "
-                                "(e.g. via a Multi-Output Device)?"
-                            )
-                        continue
-                    silent_chunks = 0
-                    warned_silent = False
-
-                    text = self._transcribe(model, audio_chunk)
-                    self._log(f"chunk #{chunk_count} transcribed: {len(text)} chars: {text[:80]!r}")
-                    if text:
-                        self._transcript.append(text)
-                        self._storage.append_transcript(text)
+            remaining = self._run_chunk_loop(audio_queue, transcriber)
 
         # Flush any remaining audio that did not fill a full chunk.
-        if accumulator:
-            audio_chunk = np.concatenate(accumulator)
-            text = self._transcribe(model, audio_chunk)
+        if remaining:
+            audio_chunk = np.concatenate(remaining)
+            text = transcriber.transcribe(audio_chunk)
             if text:
                 self._transcript.append(text)
                 self._storage.append_transcript(text)
 
     # ------------------------------------------------------------------
-    # Transcription helper
+    # Core chunk-accumulation loop (testable seam)
     # ------------------------------------------------------------------
 
-    def _transcribe(self, model: WhisperModel, audio: np.ndarray) -> str:
-        """Transcribe a 1-D float32 numpy array; return combined text or empty string."""
-        segments, _info = model.transcribe(
-            audio,
-            language=self._language,
-            beam_size=5,
-            vad_filter=False,
-        )
-        return " ".join(seg.text.strip() for seg in segments).strip()
+    def _run_chunk_loop(
+        self,
+        audio_queue: "queue.Queue[np.ndarray]",
+        transcriber: Transcriber,
+    ) -> "list[np.ndarray]":
+        """Accumulate audio blocks, detect silence, and transcribe complete chunks.
+
+        Returns the leftover accumulator (blocks that did not fill a complete chunk)
+        so the caller can flush them after the stream closes.
+        """
+        frames_per_chunk = _SAMPLE_RATE * self._chunk_seconds
+        accumulator: list[np.ndarray] = []
+        accumulated_frames = 0
+        silent_chunks = 0
+        warned_silent = False
+        chunk_count = 0
+
+        while not self._stop_event.is_set():
+            try:
+                block = audio_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            accumulator.append(block)
+            accumulated_frames += len(block)
+
+            if accumulated_frames >= frames_per_chunk:
+                audio_chunk = np.concatenate(accumulator)
+                accumulator = []
+                accumulated_frames = 0
+                chunk_count += 1
+
+                rms = float(np.sqrt(np.mean(audio_chunk ** 2)))
+                peak = float(np.max(np.abs(audio_chunk)))
+                self._log(
+                    f"chunk #{chunk_count}: frames={len(audio_chunk)} "
+                    f"rms={rms:.6f} peak={peak:.6f}"
+                )
+
+                # Warn once if the meeting audio is not reaching us — a common
+                # setup mistake (system output not routed into BlackHole).
+                if rms < _SILENCE_RMS:
+                    silent_chunks += 1
+                    if silent_chunks >= _SILENCE_WARN_AFTER and not warned_silent:
+                        warned_silent = True
+                        self._log("SILENCE detected — audio is not reaching the device")
+                        print(
+                            "[AudioThread] No audio detected on the capture device. "
+                            "Is your system output routed to BlackHole "
+                            "(e.g. via a Multi-Output Device)?"
+                        )
+                    continue
+                silent_chunks = 0
+                warned_silent = False
+
+                text = transcriber.transcribe(audio_chunk)
+                self._log(f"chunk #{chunk_count} transcribed: {len(text)} chars: {text[:80]!r}")
+                if text:
+                    self._transcript.append(text)
+                    self._storage.append_transcript(text)
+
+        return accumulator
