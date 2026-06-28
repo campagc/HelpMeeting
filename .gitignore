@@ -1,8 +1,33 @@
-skills/
+# Editor / OS
+.DS_Store
+.vscode/
 .devin/
+
+# Python environment
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+.python-version
+
+# Secrets
 .env
-.vscode/
+.env.local
+
+# Skills
+skills/
+
+# Project output
 meetings/
+*.log
+
+# Test / quality tooling
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Build artifacts
+dist/
+build/
