@@ -6,13 +6,24 @@ Two turn types share the same chat session:
 
 Both accept a pre-consumed transcript delta as a plain string argument.
 Delta management (calling transcript.take_delta()) is the caller's responsibility.
-Failure is handled with retry + backoff; persistent failure returns a graceful
-inline message and never raises.
+Failure is handled with retry + backoff; persistent failure raises
+``AssistantUnavailable`` carrying the attendee-facing message.
 """
 import time
 
 from google.genai import types
 from google.genai.errors import APIError
+
+
+class AssistantUnavailable(Exception):
+    """The assistant could not answer after all retries.
+
+    The message is the same attendee-facing text the assistant previously
+    returned as a graceful inline apology. Raising it lets the conversation
+    module record that text in the archive (so the meeting record stays
+    complete) while still reporting the turn as a failure to the rest of the
+    pipeline.
+    """
 
 
 _EXPLAIN_INSTRUCTION = (
@@ -87,7 +98,7 @@ class Assistant:
                 last_exc = exc
                 if attempt < self._max_retries:
                     time.sleep(self._retry_wait)
-        return self._graceful_message(last_exc)
+        raise AssistantUnavailable(self._graceful_message(last_exc))
 
     @staticmethod
     def _graceful_message(exc: Exception | None) -> str:

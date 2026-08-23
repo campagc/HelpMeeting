@@ -4,7 +4,7 @@ All tests run against a fake Gemini client — no network access.
 """
 import pytest
 
-from src.assistant import Assistant
+from src.assistant import Assistant, AssistantUnavailable
 from src.transcript import Transcript
 
 
@@ -247,7 +247,7 @@ class TestRetry:
         assert result == "eventually ok"
         assert len(chat.calls) == 2  # one failure + one success
 
-    def test_persistent_failure_returns_graceful_message_not_exception(self):
+    def test_persistent_failure_raises_assistant_unavailable(self):
         class AlwaysFailChats:
             def create(self, *, model, config=None, history=None):
                 return AlwaysFailChat()
@@ -262,8 +262,37 @@ class TestRetry:
             retry_wait_seconds=0,
         )
 
-        result = assistant.explain_slide(image_bytes=b"PNG", delta="text")
+        with pytest.raises(AssistantUnavailable, match="Could not get a response"):
+            assistant.explain_slide(image_bytes=b"PNG", delta="text")
 
-        assert isinstance(result, str)
-        assert len(result) > 0  # something was returned, not an empty string
-        # Must not raise — the test reaching here is proof
+    def test_rate_limit_message_is_rate_limit_wording(self):
+        class AlwaysRateLimitedChats:
+            def create(self, *, model, config=None, history=None):
+                return AlwaysFailChat()
+
+        class AlwaysRateLimitedClient:
+            chats = AlwaysRateLimitedChats()
+
+        # AlwaysFailChat raises a 500, not a 429, so we force the rate wording
+        # by injecting a 429-style failure.
+        class RateLimitedChat:
+            def send_message(self, parts):
+                from google.genai.errors import ServerError
+                raise ServerError(code=429, response_json={"error": {"message": "rate limited"}})
+
+        class RateLimitedChats:
+            def create(self, *, model, config=None, history=None):
+                return RateLimitedChat()
+
+        class RateLimitedClient:
+            chats = RateLimitedChats()
+
+        assistant = Assistant(
+            client=RateLimitedClient(),
+            model="m",
+            max_retries=1,
+            retry_wait_seconds=0,
+        )
+
+        with pytest.raises(AssistantUnavailable, match="Rate limited"):
+            assistant.explain_slide(image_bytes=b"PNG", delta="text")

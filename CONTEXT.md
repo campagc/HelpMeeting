@@ -64,7 +64,7 @@ taken.
 
 **Outcome badge**:
 Shown briefly when a turn resolves — one badge with two readings, done and failed. It
-reports that the turn reached the archive, not what the turn said.
+reports whether the turn produced a usable answer.
 _Avoid_: Ready badge, done badge, error badge
 
 ## Flagged ambiguities

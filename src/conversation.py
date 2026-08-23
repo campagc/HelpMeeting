@@ -16,6 +16,8 @@ Both return the assistant's text.  Both advance the transcript delta pointer via
 decides how to surface them.
 """
 
+from src.assistant import AssistantUnavailable
+
 
 class Conversation:
     """One meeting's turn logic, over a shared transcript, storage, and assistant."""
@@ -29,7 +31,15 @@ class Conversation:
         """Explain turn: current slide image + transcript delta since the last turn."""
         delta = self._transcript.take_delta()
         slide_path = self._storage.save_slide(slide_bytes)
-        explanation = self._assistant.explain_slide(image_bytes=slide_bytes, delta=delta)
+        try:
+            explanation = self._assistant.explain_slide(image_bytes=slide_bytes, delta=delta)
+        except AssistantUnavailable as exc:
+            self._storage.record_turn(
+                role="assistant",
+                content=str(exc),
+                slide_path=slide_path,
+            )
+            raise
         self._storage.record_turn(
             role="assistant",
             content=explanation,
@@ -41,6 +51,10 @@ class Conversation:
         """Question turn: typed question + transcript delta, no new slide."""
         delta = self._transcript.take_delta()
         self._storage.record_turn(role="user", content=question)
-        answer = self._assistant.ask_question(text=question, delta=delta)
+        try:
+            answer = self._assistant.ask_question(text=question, delta=delta)
+        except AssistantUnavailable as exc:
+            self._storage.record_turn(role="assistant", content=str(exc))
+            raise
         self._storage.record_turn(role="assistant", content=answer)
         return answer

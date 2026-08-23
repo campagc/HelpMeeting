@@ -16,6 +16,7 @@ import queue
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.assistant import AssistantUnavailable
 from src.config import load, MissingApiKeyError, format_hotkeys
 from src.hud import HudPanel, NullHud
 
@@ -189,11 +190,33 @@ class MeetingSession:
                     self._do_explain(payload)
                 elif task_type == "question":
                     self._do_question(payload)
-            except Exception as exc:  # noqa: BLE001
+            except AssistantUnavailable as exc:
+                # The conversation module has already recorded the carried text
+                # as the assistant's turn. Surface it as the terminal error.
                 ok = False
+                self._safe_print(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                # A non-assistant failure still leaves one short note in the
+                # archive so the gap is not unexplained.
+                ok = False
+                self._record_failure_note(exc)
                 self._safe_print(f"[Error processing turn: {exc}]")
             finally:
                 self._hud.turn_finished(ok)
+
+    def _record_failure_note(self, exc: Exception) -> None:
+        """Best-effort archive note for a pipeline failure.
+
+        The archive may itself be what broke, so a failure while writing the
+        note is swallowed rather than propagated.
+        """
+        try:
+            self._storage.record_turn(
+                role="assistant",
+                content=f"[Turn failed: {exc}]",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _do_explain(self, png_bytes: bytes) -> None:
         explanation = self._conversation.explain(png_bytes)

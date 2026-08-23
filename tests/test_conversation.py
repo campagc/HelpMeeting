@@ -3,6 +3,9 @@ interface (no threads, no queue)."""
 
 import json
 
+import pytest
+
+from src.assistant import AssistantUnavailable
 from src.conversation import Conversation
 from src.storage import Storage
 from src.transcript import Transcript
@@ -97,7 +100,63 @@ class TestFailurePropagates:
 
         conv, _storage, _t, _a = _conversation(tmp_path, assistant=FailingAssistant())
 
-        import pytest
-
         with pytest.raises(RuntimeError, match="model unreachable"):
             conv.explain(b"img")
+
+
+class UnavailableAssistant:
+    """Assistant that raises AssistantUnavailable, like the real assistant module."""
+
+    def __init__(self, message="[Could not get a response from the assistant]"):
+        self._message = message
+        self.explain_calls = []
+        self.ask_calls = []
+
+    def explain_slide(self, *, image_bytes, delta):
+        self.explain_calls.append((image_bytes, delta))
+        raise AssistantUnavailable(self._message)
+
+    def ask_question(self, *, text, delta):
+        self.ask_calls.append((text, delta))
+        raise AssistantUnavailable(self._message)
+
+
+class TestAssistantUnavailable:
+    def test_explain_records_failure_text_then_re_raises(self, tmp_path):
+        transcript = Transcript()
+        transcript.append("new speech since last turn")
+        conv, _storage, _t, assistant = _conversation(
+            tmp_path,
+            transcript=transcript,
+            assistant=UnavailableAssistant("[Rate limited — please wait.]"),
+        )
+
+        with pytest.raises(AssistantUnavailable, match="Rate limited"):
+            conv.explain(b"\x89PNG fake")
+
+        turns = _history(tmp_path)
+        assert len(turns) == 1
+        assert turns[0]["role"] == "assistant"
+        assert turns[0]["content"] == "[Rate limited — please wait.]"
+        assert (tmp_path / "meetings" / "test-meeting" / "slides" / "slide_0001.png").exists()
+        assert assistant.explain_calls == [(b"\x89PNG fake", "new speech since last turn")]
+
+    def test_ask_records_user_then_failure_text_then_re_raises(self, tmp_path):
+        transcript = Transcript()
+        transcript.append("latest speech")
+        conv, _storage, _t, assistant = _conversation(
+            tmp_path,
+            transcript=transcript,
+            assistant=UnavailableAssistant("[Could not get a response]"),
+        )
+
+        with pytest.raises(AssistantUnavailable, match="Could not get a response"):
+            conv.ask("What does this mean?")
+
+        turns = _history(tmp_path)
+        assert len(turns) == 2
+        assert turns[0]["role"] == "user"
+        assert turns[0]["content"] == "What does this mean?"
+        assert turns[1]["role"] == "assistant"
+        assert turns[1]["content"] == "[Could not get a response]"
+        assert assistant.ask_calls == [("What does this mean?", "latest speech")]

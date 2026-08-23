@@ -13,7 +13,8 @@ import time
 import AppKit  # type: ignore[import-untyped]
 import pytest
 
-from src.hud import NullHud, HudPanel
+from src.feedback import Badge, BadgeKind
+from src.hud import NullHud, HudPanel, badge_glyph
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +73,24 @@ class TestNullHudFallback:
 
 
 # ---------------------------------------------------------------------------
+# Badge-to-glyph mapping
+# ---------------------------------------------------------------------------
+
+
+class TestBadgeGlyph:
+    """The badge-to-glyph mapping is a pure function with no AppKit fake."""
+
+    def test_thinking_badge_maps_to_orange_dot(self):
+        assert badge_glyph(Badge(BadgeKind.THINKING)) == "\N{LARGE ORANGE CIRCLE}"
+
+    def test_successful_outcome_maps_to_green_dot(self):
+        assert badge_glyph(Badge(BadgeKind.OUTCOME, success=True)) == "\N{LARGE GREEN CIRCLE}"
+
+    def test_failed_outcome_maps_to_red_dot(self):
+        assert badge_glyph(Badge(BadgeKind.OUTCOME, success=False)) == "\N{LARGE RED CIRCLE}"
+
+
+# ---------------------------------------------------------------------------
 # Fakes for the AppKit integration tests
 # ---------------------------------------------------------------------------
 
@@ -120,6 +139,8 @@ class FakeNSPanel:
         self.floating = None
         self.becomes_key_only = None
         self.hides_on_deactivate = None
+        self.opaque = None
+        self.background_color = None
         self.content_view = None
         self.is_visible = False
         self.is_closed = False
@@ -150,6 +171,12 @@ class FakeNSPanel:
 
     def setHidesOnDeactivate_(self, flag):
         self.hides_on_deactivate = flag
+
+    def setOpaque_(self, flag):
+        self.opaque = flag
+
+    def setBackgroundColor_(self, color):
+        self.background_color = color
 
     def setContentView_(self, view):
         self.content_view = view
@@ -345,11 +372,11 @@ class TestHudPanel:
 
         assert panel.is_visible is True
         assert panel.content_view is not None
-        assert panel.content_view.string == "Thinking"
+        assert panel.content_view.string == "\N{LARGE ORANGE CIRCLE}"
         assert hud.window_id == panel.window_number
 
         assert panel.style_mask == (
-            AppKit.NSHUDWindowMask | AppKit.NSNonactivatingPanelMask
+            AppKit.NSBorderlessWindowMask | AppKit.NSNonactivatingPanelMask
         )
         assert panel.level == AppKit.NSStatusWindowLevel
         assert panel.collection_behavior == (
@@ -362,15 +389,23 @@ class TestHudPanel:
         assert panel.floating is True
         assert panel.becomes_key_only is True
         assert panel.hides_on_deactivate is False
+        assert panel.opaque is False
+        assert panel.background_color is AppKit.NSColor.clearColor()
 
+        # The dot lives in a small square panel with the glyph filling it.
+        assert panel.rect.size.width == panel.rect.size.height
         label = panel.content_view
-        assert label.draws_background is True
+        assert label.rect.size.width == panel.rect.size.width
+        assert label.rect.size.height == panel.rect.size.height
+        assert label.font is not None
+        assert label.font.pointSize() >= 18.0
+        assert label.draws_background is False
         assert label.editable is False
         assert label.selectable is False
         assert label.bordered is False
         assert label.alignment == AppKit.NSCenterTextAlignment
 
-    def test_turn_finished_success_shows_green_done_badge(self, monkeypatch):
+    def test_turn_finished_success_shows_green_dot(self, monkeypatch):
         monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
 
@@ -381,10 +416,9 @@ class TestHudPanel:
         hud.turn_finished(True)
 
         assert panel.is_visible is True
-        assert panel.content_view.string == "\u2713 Done"
-        assert panel.content_view.background_color is AppKit.NSColor.greenColor()
+        assert panel.content_view.string == "\N{LARGE GREEN CIRCLE}"
 
-    def test_turn_finished_failure_shows_red_failed_badge(self, monkeypatch):
+    def test_turn_finished_failure_shows_red_dot(self, monkeypatch):
         monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
 
@@ -395,8 +429,7 @@ class TestHudPanel:
         hud.turn_finished(False)
 
         assert panel.is_visible is True
-        assert panel.content_view.string == "\u2717 Failed"
-        assert panel.content_view.background_color is AppKit.NSColor.redColor()
+        assert panel.content_view.string == "\N{LARGE RED CIRCLE}"
 
     def test_outcome_badge_dismisses_after_interval(self, monkeypatch):
         monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
@@ -410,7 +443,7 @@ class TestHudPanel:
         hud.turn_finished(True)
 
         assert panel.is_visible is True
-        assert panel.content_view.string == "\u2713 Done"
+        assert panel.content_view.string == "\N{LARGE GREEN CIRCLE}"
 
         assert len(FakeTimer.instances) == 1
         timer = FakeTimer.instances[-1]
@@ -435,18 +468,17 @@ class TestHudPanel:
         panel = FakeNSPanel.instances[-1]
 
         hud.turn_finished(True)
-        assert panel.content_view.string == "\u2713 Done"
+        assert panel.content_view.string == "\N{LARGE GREEN CIRCLE}"
 
         first_timer = FakeTimer.instances[-1]
         first_timer.fire()
 
         assert panel.is_visible is True
-        assert panel.content_view.string == "Thinking"
-        assert panel.content_view.background_color is AppKit.NSColor.blackColor()
+        assert panel.content_view.string == "\N{LARGE ORANGE CIRCLE}"
 
         # The second turn finishes and its Outcome badge dismisses, leaving nothing.
         hud.turn_finished(False)
-        assert panel.content_view.string == "\u2717 Failed"
+        assert panel.content_view.string == "\N{LARGE RED CIRCLE}"
 
         second_timer = FakeTimer.instances[-1]
         second_timer.fire()
@@ -521,7 +553,7 @@ class TestHudPanel:
         # dismisses itself — all without a real run loop running.
         panel = FakeNSPanel.instances[-1]
         assert panel.is_visible is True
-        assert panel.content_view.string == "\u2713 Done"
+        assert panel.content_view.string == "\N{LARGE GREEN CIRCLE}"
 
         timer = FakeTimer.instances[-1]
         timer.fire()

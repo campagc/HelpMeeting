@@ -25,7 +25,7 @@ import threading
 import weakref
 from typing import Any, Mapping, Protocol
 
-from src.feedback import BadgeKind, Feedback
+from src.feedback import Badge, BadgeKind, Feedback
 
 # mss gives the actual display the attendee chose for screenshots.  NSScreen may
 # order displays differently, so we anchor the badge to the mss monitor.
@@ -44,10 +44,10 @@ try:
         NSApplication,
         NSApplicationActivationPolicyAccessory,
         NSBackingStoreBuffered,
+        NSBorderlessWindowMask,
         NSCenterTextAlignment,
         NSColor,
         NSFont,
-        NSHUDWindowMask,
         NSMakeRect,
         NSNonactivatingPanelMask,
         NSPanel,
@@ -71,10 +71,10 @@ except (ImportError, ModuleNotFoundError):
     objc = None
     NSApplication = None
     NSBackingStoreBuffered = None
+    NSBorderlessWindowMask = None
     NSCenterTextAlignment = None
     NSColor = None
     NSFont = None
-    NSHUDWindowMask = None
     NSMakeRect = None
     NSNonactivatingPanelMask = None
     NSPanel = None
@@ -89,6 +89,28 @@ except (ImportError, ModuleNotFoundError):
     NSObject = None
     NSRunLoop = None
     NSTimer = None
+
+# ---------------------------------------------------------------------------
+# Badge-to-glyph mapping
+# ---------------------------------------------------------------------------
+
+THINKING_GLYPH = "\N{LARGE ORANGE CIRCLE}"
+SUCCESS_GLYPH = "\N{LARGE GREEN CIRCLE}"
+FAILURE_GLYPH = "\N{LARGE RED CIRCLE}"
+
+
+def badge_glyph(badge: Badge) -> str:
+    """Return the coloured dot glyph for ``badge``.
+
+    This is a pure module-level function: it knows nothing about AppKit and
+    can be tested without a fake window system.
+    """
+    if badge.kind is BadgeKind.THINKING:
+        return THINKING_GLYPH
+    if badge.kind is BadgeKind.OUTCOME:
+        return SUCCESS_GLYPH if badge.success else FAILURE_GLYPH
+    return ""
+
 
 # ---------------------------------------------------------------------------
 # AppKit helpers
@@ -321,9 +343,9 @@ class HudPanel(_BaseHud):
     ``src.feedback``.
     """
 
-    _PANEL_WIDTH = 120
-    _PANEL_HEIGHT = 36
+    _PANEL_SIZE = 28
     _PANEL_PADDING = 12
+    _GLYPH_POINT_SIZE = 20.0
 
     def __init__(self, monitor_index: int = 1, outcome_seconds: float = 1.5) -> None:
         super().__init__()
@@ -441,22 +463,8 @@ class HudPanel(_BaseHud):
         assert self._panel is not None
         assert self._label is not None
 
-        if badge.kind is BadgeKind.THINKING:
-            self._label.setStringValue_("Thinking")
-            self._label.setBackgroundColor_(NSColor.blackColor())
-            self._label.setTextColor_(NSColor.whiteColor())
-            self._panel.orderFront_(None)
-        elif badge.kind is BadgeKind.OUTCOME:
-            if badge.success:
-                text = "\u2713 Done"
-                color = NSColor.greenColor()
-            else:
-                text = "\u2717 Failed"
-                color = NSColor.redColor()
-            self._label.setStringValue_(text)
-            self._label.setBackgroundColor_(color)
-            self._label.setTextColor_(NSColor.whiteColor())
-            self._panel.orderFront_(None)
+        self._label.setStringValue_(badge_glyph(badge))
+        self._panel.orderFront_(None)
 
         self._cancel_outcome_timer()
         if badge.kind is BadgeKind.OUTCOME:
@@ -528,15 +536,15 @@ class HudPanel(_BaseHud):
             width = float(monitor.get("width", 0))
             height = float(monitor.get("height", 0))
 
-            x = left + width - self._PANEL_WIDTH - self._PANEL_PADDING
+            x = left + width - self._PANEL_SIZE - self._PANEL_PADDING
             # Convert mss top-left Quartz coordinates to AppKit bottom-left.
             y = -(top + height) + self._main_height + self._PANEL_PADDING
 
         return NSMakeRect(
             float(x),
             float(y),
-            float(self._PANEL_WIDTH),
-            float(self._PANEL_HEIGHT),
+            float(self._PANEL_SIZE),
+            float(self._PANEL_SIZE),
         )
 
     def _ensure_panel(self) -> None:
@@ -547,7 +555,7 @@ class HudPanel(_BaseHud):
         rect = self._content_rect()
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             rect,
-            NSHUDWindowMask | NSNonactivatingPanelMask,
+            NSBorderlessWindowMask | NSNonactivatingPanelMask,
             NSBackingStoreBuffered,
             False,
         )
@@ -573,19 +581,21 @@ class HudPanel(_BaseHud):
         panel.setBecomesKeyOnlyIfNeeded_(True)
         panel.setHidesOnDeactivate_(False)
 
+        # No window chrome and no background — the dot is the only content.
+        panel.setOpaque_(False)
+        panel.setBackgroundColor_(NSColor.clearColor())
+
         label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(0.0, 0.0, float(self._PANEL_WIDTH), float(self._PANEL_HEIGHT))
+            NSMakeRect(0.0, 0.0, float(self._PANEL_SIZE), float(self._PANEL_SIZE))
         )
-        label.setStringValue_("Thinking")
+        label.setStringValue_("")
         label.setBezeled_(False)
-        label.setDrawsBackground_(True)
-        label.setBackgroundColor_(NSColor.blackColor())
-        label.setTextColor_(NSColor.whiteColor())
-        label.setFont_(NSFont.boldSystemFontOfSize_(14.0))
-        label.setAlignment_(NSCenterTextAlignment)
+        label.setBordered_(False)
         label.setEditable_(False)
         label.setSelectable_(False)
-        label.setBordered_(False)
+        label.setDrawsBackground_(False)
+        label.setFont_(NSFont.systemFontOfSize_(self._GLYPH_POINT_SIZE))
+        label.setAlignment_(NSCenterTextAlignment)
 
         panel.setContentView_(label)
         self._panel = panel

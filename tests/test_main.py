@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from src.assistant import AssistantUnavailable
 from src.main import main, prompt_settings, MeetingSession, resolve_audio_device
 from src.conversation import Conversation
 from src.storage import Storage
@@ -194,13 +195,42 @@ class FakeHud:
 
 
 class FailingAssistant:
-    """Assistant that always raises on explain_slide for failure-path tests."""
+    """Assistant that gives up on explain_slide, like the real assistant module."""
 
     def explain_slide(self, *, image_bytes: bytes, delta: str) -> str:
-        raise RuntimeError("model unreachable")
+        raise AssistantUnavailable("[Could not get a response from the assistant: model unreachable]")
 
     def ask_question(self, *, text: str, delta: str) -> str:
         return "ok"
+
+
+class ExplodingAssistant:
+    """Assistant that fails with a plain exception, triggering the pipeline failure path."""
+
+    def explain_slide(self, *, image_bytes: bytes, delta: str) -> str:
+        raise RuntimeError("screen grab failed")
+
+    def ask_question(self, *, text: str, delta: str) -> str:
+        raise RuntimeError("network broken")
+
+
+class CountingStorage(Storage):
+    """Storage that counts record_turn calls."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.record_turn_calls = 0
+
+    def record_turn(self, role, content, slide_path=None):
+        self.record_turn_calls += 1
+        super().record_turn(role, content, slide_path)
+
+
+class BrokenStorage(Storage):
+    """Storage whose record_turn always raises."""
+
+    def record_turn(self, role, content, slide_path=None):
+        raise OSError("disk full")
 
 
 class TestHotkeyCallback:
@@ -299,10 +329,125 @@ class TestAIFailure:
         assert any("model unreachable" in line for line in outputs)
         history_path = tmp_path / "meetings" / "test-meeting" / "history.json"
         turns = json.loads(history_path.read_text())
-        assert len(turns) == 2  # user question + successful answer
-        assert turns[0]["role"] == "user"
-        assert turns[1]["role"] == "assistant"
-        assert turns[1]["content"] == "ok"
+        # The failed hotkey is one assistant turn, then the successful question.
+        assert len(turns) == 3
+        assert turns[0]["role"] == "assistant"
+        assert "Could not get a response" in turns[0]["content"]
+        assert turns[1]["role"] == "user"
+        assert turns[1]["content"] == "Can you retry?"
+        assert turns[2]["role"] == "assistant"
+        assert turns[2]["content"] == "ok"
+
+
+class TestPipelineFailure:
+    def test_non_assistant_failure_records_one_note_and_keeps_running(self, tmp_path):
+        transcript = Transcript()
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        assistant = ExplodingAssistant()
+        audio_thread = FakeAudioThread()
+        capture = FakeCapture()
+        outputs = []
+
+        session = _make_session(
+            transcript=transcript,
+            storage=storage,
+            assistant=assistant,
+            audio_thread=audio_thread,
+            capture=capture,
+            output_fn=outputs.append,
+        )
+        session.start()
+        session.on_hotkey(b"\x89PNG fake")
+        session.stop()
+
+        assert any("screen grab failed" in line for line in outputs)
+
+        history_path = tmp_path / "meetings" / "test-meeting" / "history.json"
+        turns = json.loads(history_path.read_text())
+        assert len(turns) == 1
+        assert turns[0]["role"] == "assistant"
+        assert "Turn failed" in turns[0]["content"]
+        assert "screen grab failed" in turns[0]["content"]
+
+    def test_successful_turn_records_no_failure_note(self, tmp_path):
+        transcript = Transcript()
+        transcript.append("new speech since last turn")
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        assistant = FakeAssistant()
+        audio_thread = FakeAudioThread()
+        capture = FakeCapture()
+
+        session = _make_session(
+            transcript=transcript,
+            storage=storage,
+            assistant=assistant,
+            audio_thread=audio_thread,
+            capture=capture,
+        )
+        session.start()
+        session.on_hotkey(b"\x89PNG fake")
+        session.stop()
+
+        history_path = tmp_path / "meetings" / "test-meeting" / "history.json"
+        turns = json.loads(history_path.read_text())
+        assert len(turns) == 1
+        assert turns[0]["role"] == "assistant"
+        assert "Turn failed" not in turns[0]["content"]
+
+
+class TestFailureNote:
+    def test_assistant_failure_does_not_add_second_archive_entry(self, tmp_path):
+        storage = CountingStorage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        assistant = FailingAssistant()
+        audio_thread = FakeAudioThread()
+        capture = FakeCapture()
+
+        session = _make_session(
+            transcript=Transcript(),
+            storage=storage,
+            assistant=assistant,
+            audio_thread=audio_thread,
+            capture=capture,
+        )
+        session.start()
+        session.on_hotkey(b"\x89PNG fake")
+        session.stop()
+
+        # The conversation recorded the failure; the worker did not add another.
+        assert storage.record_turn_calls == 1
+
+    def test_failed_note_write_is_swallowed_and_session_keeps_running(self, tmp_path):
+        class BrokenConversation:
+            """Conversation that raises a generic exception without recording."""
+
+            def explain(self, slide_bytes):
+                raise RuntimeError("pipeline broke")
+
+            def ask(self, question):
+                raise RuntimeError("pipeline broke")
+
+        storage = BrokenStorage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        hud = FakeHud()
+        outputs = []
+
+        session = MeetingSession(
+            conversation=BrokenConversation(),
+            storage=storage,
+            audio_thread=FakeAudioThread(),
+            capture=FakeCapture(),
+            output_fn=outputs.append,
+            hud=hud,
+        )
+        session.start()
+        session.on_hotkey(b"\x89PNG fake")
+        session.stop()
+
+        assert any("pipeline broke" in line for line in outputs)
+        assert hud.turn_finished_calls == [False]
 
 
 class TestShutdown:
