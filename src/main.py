@@ -185,11 +185,12 @@ class MeetingSession:
                 break
             task_type, payload = item
             ok = True
+            result: str | None = None
             try:
                 if task_type == "explain":
-                    self._do_explain(payload)
+                    result = self._do_explain(payload)
                 elif task_type == "question":
-                    self._do_question(payload)
+                    result = self._do_question(payload)
             except AssistantUnavailable as exc:
                 # The conversation module has already recorded the carried text
                 # as the assistant's turn. Surface it as the terminal error.
@@ -201,6 +202,12 @@ class MeetingSession:
                 ok = False
                 self._record_failure_note(exc)
                 self._safe_print(f"[Error processing turn: {exc}]")
+            else:
+                # The turn succeeded; printing its result is not part of the
+                # turn's failure surface.
+                if result is not None:
+                    heading = "[Explanation]" if task_type == "explain" else "[Answer]"
+                    self._safe_print(f"\n{heading}\n{result}\n")
             finally:
                 self._hud.turn_finished(ok)
 
@@ -218,13 +225,11 @@ class MeetingSession:
         except Exception:  # noqa: BLE001
             pass
 
-    def _do_explain(self, png_bytes: bytes) -> None:
-        explanation = self._conversation.explain(png_bytes)
-        self._safe_print(f"\n[Explanation]\n{explanation}\n")
+    def _do_explain(self, png_bytes: bytes) -> str:
+        return self._conversation.explain(png_bytes)
 
-    def _do_question(self, question: str) -> None:
-        answer = self._conversation.ask(question)
-        self._safe_print(f"\n[Answer]\n{answer}\n")
+    def _do_question(self, question: str) -> str:
+        return self._conversation.ask(question)
 
     def _safe_print(self, message: str) -> None:
         with self._print_lock:

@@ -139,6 +139,7 @@ class FakeNSPanel:
         self.floating = None
         self.becomes_key_only = None
         self.hides_on_deactivate = None
+        self.has_shadow = None
         self.opaque = None
         self.background_color = None
         self.content_view = None
@@ -171,6 +172,9 @@ class FakeNSPanel:
 
     def setHidesOnDeactivate_(self, flag):
         self.hides_on_deactivate = flag
+
+    def setHasShadow_(self, flag):
+        self.has_shadow = flag
 
     def setOpaque_(self, flag):
         self.opaque = flag
@@ -389,6 +393,7 @@ class TestHudPanel:
         assert panel.floating is True
         assert panel.becomes_key_only is True
         assert panel.hides_on_deactivate is False
+        assert panel.has_shadow is False
         assert panel.opaque is False
         assert panel.background_color is AppKit.NSColor.clearColor()
 
@@ -484,6 +489,24 @@ class TestHudPanel:
         second_timer.fire()
 
         assert panel.is_visible is False
+
+    def test_run_closes_panel_on_stop(self, monkeypatch):
+        monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
+        monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
+        monkeypatch.setattr("src.hud.NSApplication", FakeNSApplication)
+        monkeypatch.setattr("src.hud.NSRunLoop", FakeNSRunLoop)
+        monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
+        monkeypatch.setattr("src.hud.NSDate", FakeNSDate)
+
+        hud = HudPanel(monitor_index=1)
+        hud.turn_started()
+        panel = FakeNSPanel.instances[-1]
+        assert panel.is_closed is False
+
+        threading.Timer(0.05, hud.stop).start()
+        hud.run()
+
+        assert panel.is_closed is True
 
     def test_run_on_main_thread_uses_appkit_run_loop(self, monkeypatch):
         monkeypatch.setattr("src.hud.NSApplication", FakeNSApplication)

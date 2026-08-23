@@ -102,7 +102,8 @@ class Assistant:
 
     @staticmethod
     def _graceful_message(exc: Exception | None) -> str:
-        msg = str(exc) if exc else "unknown error"
-        if "429" in msg or "rate" in msg.lower():
+        # Detect rate limits by the structured error code, not by matching prose.
+        if isinstance(exc, APIError) and exc.code == 429:
             return "[Rate limited — please wait a moment and try again.]"
+        msg = str(exc) if exc else "unknown error"
         return f"[Could not get a response from the assistant: {msg}]"

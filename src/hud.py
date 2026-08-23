@@ -409,8 +409,7 @@ class HudPanel(_BaseHud):
 
     def _after_run_loop(self) -> None:
         """Hide the panel and tear down the outcome timer when the run loop exits."""
-        self._cancel_outcome_timer()
-        self._hide()
+        self._close_panel()
 
     def _call_on_main(self, py_method: str, objc_selector: str, obj: Any = None) -> None:
         """Call a bridge method, either directly or via the main run loop."""
@@ -446,9 +445,8 @@ class HudPanel(_BaseHud):
         self._render()
 
     def _on_stop(self) -> None:
-        """Cancel the dismiss timer and hide the panel."""
-        self._cancel_outcome_timer()
-        self._hide()
+        """Cancel the dismiss timer and close the panel."""
+        self._close_panel()
 
     def _render(self) -> None:
         """Query the state machine and display whatever badge it reports."""
@@ -580,6 +578,7 @@ class HudPanel(_BaseHud):
         panel.setFloatingPanel_(True)
         panel.setBecomesKeyOnlyIfNeeded_(True)
         panel.setHidesOnDeactivate_(False)
+        panel.setHasShadow_(False)
 
         # No window chrome and no background — the dot is the only content.
         panel.setOpaque_(False)
@@ -611,3 +610,15 @@ class HudPanel(_BaseHud):
             self._panel = None
             self._label = None
             self._window_id = None
+
+    def _close_panel(self) -> None:
+        """Close the panel and clear the cached references."""
+        self._cancel_outcome_timer()
+        try:
+            if self._panel is not None:
+                self._panel.close()
+        except Exception:
+            pass
+        self._panel = None
+        self._label = None
+        self._window_id = None
