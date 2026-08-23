@@ -426,7 +426,7 @@ class HudPanel(_BaseHud):
             y = -(top + height) + self._main_height + self._PANEL_PADDING
 
         return NSMakeRect(
-            max(0.0, float(x)),
+            float(x),
             float(y),
             float(self._PANEL_WIDTH),
             float(self._PANEL_HEIGHT),
