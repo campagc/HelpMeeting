@@ -20,7 +20,16 @@ degrades to the non-AppKit fallback so the meeting continues.
 
 import threading
 import weakref
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
+
+# mss gives the actual display the attendee chose for screenshots.  NSScreen may
+# order displays differently, so we anchor the badge to the mss monitor.
+try:
+    import mss
+    _MSS_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    _MSS_AVAILABLE = False
+    mss = None  # type: ignore[assignment]
 
 # Import AppKit/ObjC at module load if present.  The implementations must still
 # be importable when they are absent, so any failure here is non-fatal.
@@ -34,16 +43,14 @@ try:
         NSColor,
         NSFont,
         NSHUDWindowMask,
-        NSMainMenuWindowLevel,
         NSMakeRect,
         NSNonactivatingPanelMask,
         NSPanel,
-        NSScreen,
         NSStatusWindowLevel,
         NSTextField,
+        NSWindowCollectionBehaviorCanJoinAllApplications,
         NSWindowCollectionBehaviorCanJoinAllSpaces,
         NSWindowCollectionBehaviorFullScreenAuxiliary,
-        NSWindowCollectionBehaviorStationary,
         NSWindowSharingNone,
     )
     from Foundation import (  # type: ignore[import-untyped]
@@ -63,16 +70,14 @@ except (ImportError, ModuleNotFoundError):
     NSColor = None
     NSFont = None
     NSHUDWindowMask = None
-    NSMainMenuWindowLevel = None
     NSMakeRect = None
     NSNonactivatingPanelMask = None
     NSPanel = None
-    NSScreen = None
     NSStatusWindowLevel = None
     NSTextField = None
+    NSWindowCollectionBehaviorCanJoinAllApplications = None
     NSWindowCollectionBehaviorCanJoinAllSpaces = None
     NSWindowCollectionBehaviorFullScreenAuxiliary = None
-    NSWindowCollectionBehaviorStationary = None
     NSWindowSharingNone = None
     NSDate = None
     NSDefaultRunLoopMode = None
@@ -148,14 +153,15 @@ class Hud(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Null/fallback implementation
+# Shared AppKit run-loop logic
 # ---------------------------------------------------------------------------
 
-class NullHud:
-    """Default HUD: no panel, no badges, but it owns the main run loop.
+class _BaseHud:
+    """Base class for NullHud and HudPanel.
 
-    If AppKit is not available, or if run() is called on a non-main thread,
-    it falls back to a plain threading.Event so the app still functions.
+    Owns the stop event, AppKit activation policy, the interpreter-pump timer,
+    and the fallback to a plain event wait.  Subclasses provide turn lifecycle
+    and any run-loop cleanup.
     """
 
     def __init__(self) -> None:
@@ -186,14 +192,6 @@ class NullHud:
         """Signal the run loop to exit.  Safe to call multiple times."""
         self._stop_event.set()
 
-    def turn_started(self) -> None:
-        """No-op in the null implementation."""
-        pass
-
-    def turn_finished(self, ok: bool) -> None:
-        """No-op in the null implementation."""
-        pass
-
     # ------------------------------------------------------------------
     # Implementation
     # ------------------------------------------------------------------
@@ -221,6 +219,9 @@ class NullHud:
             return self._run_fallback()
 
         try:
+            # Allow HudPanel to create its bridge before starting the run loop.
+            self._prepare_appkit()
+
             app = NSApplication.sharedApplication()
             self._app = app
 
@@ -249,14 +250,45 @@ class NullHud:
             if self._pump_timer is not None:
                 self._pump_timer.invalidate()
                 self._pump_timer = None
+            self._after_run_loop()
             self._stop_event.set()
+
+    def _prepare_appkit(self) -> None:
+        """Hook for subclasses to set up the bridge before the run loop starts."""
+        pass
+
+    def _after_run_loop(self) -> None:
+        """Hook for subclasses to clean up after the run loop exits."""
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Null/fallback implementation
+# ---------------------------------------------------------------------------
+
+class NullHud(_BaseHud):
+    """Default HUD: no panel, no badges, but it owns the main run loop.
+
+    If AppKit is not available, or if run() is called on a non-main thread,
+    it falls back to a plain threading.Event so the app still functions.
+    """
+
+    def turn_started(self) -> None:
+        """No-op in the null implementation."""
+        pass
+
+    def turn_finished(self, ok: bool) -> None:
+        """No-op in the null implementation."""
+        # 'ok' is part of the protocol but not used until the Outcome badge
+        # slice.  The parameter is intentionally unused in this slice.
+        pass
 
 
 # ---------------------------------------------------------------------------
 # Real AppKit panel
 # ---------------------------------------------------------------------------
 
-class HudPanel:
+class HudPanel(_BaseHud):
     """A small non-activating floating panel that shows the Thinking badge.
 
     The panel is created on the main thread and all badge updates are
@@ -268,10 +300,9 @@ class HudPanel:
     _PANEL_PADDING = 12
 
     def __init__(self, monitor_index: int = 1) -> None:
-        self._stop_event = threading.Event()
+        super().__init__()
         self._monitor_index = monitor_index
-        self._app: Any | None = None
-        self._pump_timer: Any | None = None
+        self._monitor, self._main_height = self._load_geometry()
         self._panel: Any | None = None
         self._label: Any | None = None
         self._bridge: Any | None = None
@@ -287,24 +318,9 @@ class HudPanel:
     # Public interface
     # ------------------------------------------------------------------
 
-    def run(self) -> None:
-        """Block until stop() is called.
-
-        On the main thread with AppKit present this sets the process to an
-        accessory application and runs the main run loop.  Otherwise it falls
-        back to a plain event wait.
-        """
-        if not self._appkit_available():
-            return self._run_fallback()
-
-        if threading.current_thread() is not threading.main_thread():
-            return self._run_fallback()
-
-        return self._run_appkit()
-
     def stop(self) -> None:
         """Signal the run loop to exit and hide the panel."""
-        self._stop_event.set()
+        super().stop()
         if self._bridge is not None:
             try:
                 self._bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
@@ -315,114 +331,100 @@ class HudPanel:
 
     def turn_started(self) -> None:
         """Show the Thinking badge on the main thread."""
-        if not self._appkit_available() or self._bridge is None:
-            return
-        if threading.current_thread() is threading.main_thread():
-            try:
-                self._bridge.showThinking_(None)
-            except Exception:
-                pass
-        else:
-            try:
-                self._bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    "showThinking:", None, False
-                )
-            except Exception:
-                pass
+        self._call_on_main("showThinking_", "showThinking:")
 
     def turn_finished(self, ok: bool) -> None:
-        """Hide the badge on the main thread (single-turn slice)."""
-        del ok  # not used until the Outcome badge slice
-        if not self._appkit_available() or self._bridge is None:
-            return
-        if threading.current_thread() is threading.main_thread():
-            try:
-                self._bridge.hide_(None)
-            except Exception:
-                pass
-        else:
-            try:
-                self._bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    "hide:", None, False
-                )
-            except Exception:
-                pass
+        """Hide the badge on the main thread (single-turn slice).
+
+        'ok' is not used in this slice; the Outcome badge slice will use it.
+        """
+        _ = ok
+        self._call_on_main("hide_", "hide:")
 
     # ------------------------------------------------------------------
     # Implementation
     # ------------------------------------------------------------------
 
-    def _appkit_available(self) -> bool:
-        """Return True when the AppKit/ObjC frameworks can be imported."""
-        return _APPKIT_AVAILABLE
-
-    def _run_fallback(self) -> None:
-        """Block without AppKit."""
-        while not self._stop_event.is_set():
-            self._stop_event.wait(timeout=0.2)
-
-    def _run_appkit(self) -> None:
-        """Run the main run loop, creating the panel lazily on demand."""
-        if _Bridge is None:
-            return self._run_fallback()
-
+    def _prepare_appkit(self) -> None:
+        """Create the bridge before the run loop starts, if it wasn't already."""
+        if self._bridge is not None:
+            return
         try:
-            # Recreate the bridge in case __init__ failed or this is the first
-            # call after a fallback return.
             self._bridge = _Bridge.alloc().initWithHud_(self)
-
-            app = NSApplication.sharedApplication()
-            self._app = app
-
-            # No Dock icon, no app switcher entry, no focus stealing.
-            app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-
-            run_loop = NSRunLoop.currentRunLoop()
-
-            pump = _Bridge.alloc().init()
-            self._pump_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                0.2, pump, "tick:", None, True
-            )
-
-            while not self._stop_event.is_set():
-                try:
-                    run_loop.runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.distantFuture())
-                except KeyboardInterrupt:
-                    # Ctrl+C reaches the main thread because the pump timer
-                    # returns control to the interpreter.
-                    self._stop_event.set()
         except Exception:
-            # AppKit failed at runtime.  Degrade to the non-AppKit wait.
-            return self._run_fallback()
-        finally:
-            if self._pump_timer is not None:
-                self._pump_timer.invalidate()
-                self._pump_timer = None
-            self._hide()
-            self._stop_event.set()
+            self._bridge = None
 
-    def _screen(self) -> Any | None:
-        """Return the NSScreen the badge should be anchored to."""
-        if NSScreen is None:
-            return None
+    def _after_run_loop(self) -> None:
+        """Hide the panel when the run loop exits."""
+        self._hide()
+
+    def _call_on_main(self, py_method: str, objc_selector: str) -> None:
+        """Call a bridge method, either directly or via the main run loop."""
+        if not self._appkit_available() or self._bridge is None:
+            return
+        if threading.current_thread() is threading.main_thread():
+            try:
+                getattr(self._bridge, py_method)(None)
+            except Exception:
+                pass
+        else:
+            try:
+                self._bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    objc_selector, None, False
+                )
+            except Exception:
+                pass
+
+    def _load_geometry(self) -> tuple[Mapping[str, int] | None, int]:
+        """Return the selected mss monitor and the main display height.
+
+        The main display height is needed to convert mss top-left Quartz
+        coordinates into AppKit bottom-left coordinates.
+        """
+        if not _MSS_AVAILABLE or mss is None:
+            return None, 0
+
         try:
-            screens = NSScreen.screens()
-            if screens and 0 <= self._monitor_index - 1 < len(screens):
-                return screens[self._monitor_index - 1]
-            return screens[0] if screens else None
+            with mss.MSS() as sct:
+                all_monitors = sct.monitors
+                if not all_monitors:
+                    return None, 0
+
+                if 0 <= self._monitor_index < len(all_monitors):
+                    selected = all_monitors[self._monitor_index]
+                else:
+                    selected = all_monitors[1] if len(all_monitors) > 1 else all_monitors[0]
+
+                physical = all_monitors[1:]
+                if physical:
+                    main = next(
+                        (m for m in physical if m.get("left") == 0 and m.get("top") == 0),
+                        physical[0],
+                    )
+                    main_height = main.get("height", selected.get("height", 0))
+                else:
+                    main_height = selected.get("height", 0)
+
+                return selected, main_height
         except Exception:
-            return None
+            return None, 0
 
     def _content_rect(self) -> Any:
         """Return the panel frame for the bottom-right of the chosen screen."""
-        screen = self._screen()
-        if screen is None:
+        monitor = self._monitor
+        if monitor is None:
             x = float(self._PANEL_PADDING)
             y = float(self._PANEL_PADDING)
         else:
-            frame = screen.frame()
-            x = frame.origin.x + frame.size.width - self._PANEL_WIDTH - self._PANEL_PADDING
-            y = frame.origin.y + self._PANEL_PADDING
+            left = float(monitor.get("left", 0))
+            top = float(monitor.get("top", 0))
+            width = float(monitor.get("width", 0))
+            height = float(monitor.get("height", 0))
+
+            x = left + width - self._PANEL_WIDTH - self._PANEL_PADDING
+            # Convert mss top-left Quartz coordinates to AppKit bottom-left.
+            y = -(top + height) + self._main_height + self._PANEL_PADDING
+
         return NSMakeRect(
             max(0.0, float(x)),
             float(y),
@@ -450,7 +452,7 @@ class HudPanel:
         panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorFullScreenAuxiliary
-            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorCanJoinAllApplications
         )
 
         # Do not let the panel appear in screenshots taken by this process.

@@ -91,5 +91,5 @@ triggers, not to hotkeys, so two different hotkeys share one debounce window.
 >
 > **Dev**: Two badges per explain turn. What about a question turn?
 >
-> **Attendee**: No slide, so no first badge — but the same finished badge, because I still
-> want to know the answer landed.
+> **Attendee**: No slide, but still the same first badge when the turn starts — so I know
+> the request registered — and the same finished badge when the answer lands.

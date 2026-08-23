@@ -13,7 +13,13 @@ import time
 import AppKit  # type: ignore[import-untyped]
 import pytest
 
-from src.hud import NullHud
+from src.hud import NullHud, HudPanel
+
+
+@pytest.fixture(autouse=True)
+def _patch_mss_for_hud(monkeypatch):
+    """Keep HudPanel tests away from the real display list."""
+    monkeypatch.setattr("src.hud.mss", FakeMSSModule)
 
 
 class TestNullHudFallback:
@@ -68,8 +74,6 @@ class TestNullHudFallback:
 # ---------------------------------------------------------------------------
 # Fakes for the AppKit integration tests
 # ---------------------------------------------------------------------------
-
-import time  # noqa: E402
 
 
 class FakeApplication:
@@ -279,11 +283,33 @@ class FakeNSDate:
         return None
 
 
+class FakeMSS:
+    def __init__(self, monitors):
+        self.monitors = monitors
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class FakeMSSModule:
+    """Replacement for the mss module so tests never touch real displays."""
+
+    @staticmethod
+    def MSS():
+        return FakeMSS(
+            [
+                {},
+                {"left": 0, "top": 0, "width": 1440, "height": 900},
+            ]
+        )
+
+
 # ---------------------------------------------------------------------------
 # AppKit HUD panel tests
 # ---------------------------------------------------------------------------
-
-from src.hud import HudPanel  # noqa: E402
 
 
 class TestHudPanel:
@@ -315,7 +341,7 @@ class TestHudPanel:
         assert panel.collection_behavior == (
             AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
             | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
-            | AppKit.NSWindowCollectionBehaviorStationary
+            | AppKit.NSWindowCollectionBehaviorCanJoinAllApplications
         )
         assert panel.sharing_type == AppKit.NSWindowSharingNone
         assert panel.ignores_mouse is True

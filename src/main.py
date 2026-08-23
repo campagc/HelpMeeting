@@ -162,13 +162,16 @@ class MeetingSession:
 
     def on_hotkey(self, png_bytes: bytes) -> None:
         """Queue a slide-explanation turn."""
-        self._hud.turn_started()
-        self._task_queue.put(("explain", png_bytes))
+        self._queue_turn("explain", png_bytes)
 
     def on_question(self, text: str) -> None:
         """Queue a question-and-answer turn."""
+        self._queue_turn("question", text)
+
+    def _queue_turn(self, kind: str, payload: bytes | str) -> None:
+        """Signal the HUD and queue a turn for the worker."""
         self._hud.turn_started()
-        self._task_queue.put(("question", text))
+        self._task_queue.put((kind, payload))
 
     # ------------------------------------------------------------------
     # Internal worker
@@ -272,7 +275,7 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
         capture=None,  # set below after wiring the hotkey callback
         input_fn=input_fn,
         output_fn=output_fn,
-        hud=hud if hud is not None else NullHud(),
+        hud=hud,
     )
     capture = Capture(
         callback=session.on_hotkey,

@@ -192,6 +192,16 @@ class FakeHud:
         self.turn_finished_calls.append(ok)
 
 
+class FailingAssistant:
+    """Assistant that always raises on explain_slide for failure-path tests."""
+
+    def explain_slide(self, *, image_bytes: bytes, delta: str) -> str:
+        raise RuntimeError("model unreachable")
+
+    def ask_question(self, *, text: str, delta: str) -> str:
+        return "ok"
+
+
 class TestHotkeyCallback:
     def test_explain_slide_called_and_turn_persisted(self, tmp_path):
         transcript = Transcript()
@@ -263,13 +273,6 @@ class TestQuestionCallback:
 
 class TestAIFailure:
     def test_hotkey_ai_failure_prints_inline_message_and_session_keeps_running(self, tmp_path):
-        class FailingAssistant:
-            def explain_slide(self, *, image_bytes: bytes, delta: str) -> str:
-                raise RuntimeError("model unreachable")
-
-            def ask_question(self, *, text: str, delta: str) -> str:
-                return "ok"
-
         transcript = Transcript()
         storage = Storage(base_dir=tmp_path)
         storage.start_meeting("test-meeting", ["en"])
@@ -465,13 +468,6 @@ class TestHudLifecycle:
         assert hud.turn_finished_calls == [True]
 
     def test_failed_turn_signals_finished_false(self, tmp_path):
-        class FailingAssistant:
-            def explain_slide(self, *, image_bytes: bytes, delta: str) -> str:
-                raise RuntimeError("model unreachable")
-
-            def ask_question(self, *, text: str, delta: str) -> str:
-                return "ok"
-
         transcript = Transcript()
         storage = Storage(base_dir=tmp_path)
         storage.start_meeting("test-meeting", ["en"])
