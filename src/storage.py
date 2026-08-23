@@ -18,6 +18,7 @@ class Storage:
     def __init__(self, base_dir=None):
         self._base_dir = Path(base_dir) if base_dir is not None else Path(".")
         self._meeting_dir: Path | None = None
+        self._label: str | None = None
         self._slide_counter = 0
         self._turns: list[dict] = []
 
@@ -32,6 +33,7 @@ class Storage:
 
     def start_meeting(self, label: str, langs: list[str]) -> None:
         """Create meetings/<label>/ and write skeleton files."""
+        self._label = label
         self._meeting_dir = self._base_dir / "meetings" / label
         self._meeting_dir.mkdir(parents=True, exist_ok=True)
         (self._meeting_dir / "slides").mkdir(exist_ok=True)
@@ -73,9 +75,9 @@ class Storage:
         """Append a turn to history.json and session.md.
 
         If either write fails, the turn is removed from the in-memory list and
-        history.json is best-effort restored to its previous state. Callers
-        that need a guaranteed note (e.g. the worker failure path) can retry
-        without creating duplicate entries.
+        both files are best-effort restored to their previous state. Callers
+        that need a guaranteed recorded turn (e.g. the worker failure path) can
+        retry without creating duplicate entries.
         """
         self._assert_started()
 
@@ -86,15 +88,16 @@ class Storage:
         self._turns.append(turn)
         try:
             self._flush_history()
-            self._append_session_md(turn)
+            self._regenerate_session_md()
         except Exception:  # noqa: BLE001
             # Rollback the in-memory list so a later successful record_turn
             # cannot write this phantom turn to history.json.
             if self._turns and self._turns[-1] is turn:
                 self._turns.pop()
-            # Best-effort restore the previous history.json state.
+            # Best-effort restore the previous archive state.
             try:
                 self._flush_history()
+                self._regenerate_session_md()
             except Exception:
                 pass
             raise
@@ -120,16 +123,26 @@ class Storage:
         tmp_path.write_text(json.dumps(self._turns, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(history_path)
 
-    def _append_session_md(self, turn: dict) -> None:
-        role = turn["role"].capitalize()
-        content = turn["content"]
-        slide_path = turn.get("slide_path")
+    def _regenerate_session_md(self) -> None:
+        """Rewrite session.md from the current turn list.
 
-        lines = [f"## {role}\n"]
-        if slide_path:
-            lines.append(f"![slide]({slide_path})\n\n")
-        lines.append(f"{content}\n")
-        lines.append("\n")
+        Uses a temp file and replace so session.md is never in a half-written
+        state if the write fails.
+        """
+        session_path = self._meeting_dir / "session.md"
+        tmp_path = session_path.with_suffix(".md.tmp")
 
-        with (self._meeting_dir / "session.md").open("a", encoding="utf-8") as f:
-            f.write("".join(lines))
+        lines = [f"# Meeting: {self._label}\n\n"]
+        for turn in self._turns:
+            role = turn["role"].capitalize()
+            content = turn["content"]
+            slide_path = turn.get("slide_path")
+
+            lines.append(f"## {role}\n")
+            if slide_path:
+                lines.append(f"![slide]({slide_path})\n\n")
+            lines.append(f"{content}\n")
+            lines.append("\n")
+
+        tmp_path.write_text("".join(lines), encoding="utf-8")
+        tmp_path.replace(session_path)

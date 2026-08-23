@@ -225,19 +225,23 @@ class TestStorageRecordTurnRollback:
         assert turns[0]["role"] == "user"
         assert turns[0]["content"] == "kept note"
 
-    def test_record_turn_reverts_history_json_if_append_session_md_fails(self, tmp_path):
-        """A failed session.md append must also revert history.json."""
+        session = (tmp_path / "meetings" / "2026-06-25_14-00_standup" / "session.md").read_text()
+        assert "lost note" not in session
+        assert "kept note" in session
+
+    def test_record_turn_reverts_history_json_if_session_md_fails(self, tmp_path):
+        """A failed session.md rewrite must also revert history.json."""
 
         class FlakyStorage(Storage):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self._fail = True
 
-            def _append_session_md(self, turn) -> None:
+            def _regenerate_session_md(self) -> None:
                 if self._fail:
                     self._fail = False
                     raise OSError("session.md full")
-                super()._append_session_md(turn)
+                super()._regenerate_session_md()
 
         storage = FlakyStorage(base_dir=tmp_path)
         storage.start_meeting("2026-06-25_14-00_standup", langs=["en"])
@@ -251,3 +255,7 @@ class TestStorageRecordTurnRollback:
         turns = json.loads(history_path.read_text())
         assert len(turns) == 1
         assert turns[0]["role"] == "user"
+
+        session = (tmp_path / "meetings" / "2026-06-25_14-00_standup" / "session.md").read_text()
+        assert "lost note" not in session
+        assert "kept note" in session

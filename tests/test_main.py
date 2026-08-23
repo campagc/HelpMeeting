@@ -463,9 +463,9 @@ class TestFailureNote:
         assert any("pipeline broke" in line for line in outputs)
         assert hud.turn_finished_calls == [False]
 
-    def test_failed_turn_leaves_exactly_one_archive_note(self, tmp_path):
-        """If the conversation's failure note cannot be flushed, the worker's
-        best-effort note must not be a duplicate."""
+    def test_failed_turn_leaves_exactly_one_archive_entry(self, tmp_path):
+        """If the conversation's recorded failure turn cannot be flushed, the
+        worker's best-effort recorded turn must not be a duplicate."""
         storage = FlakyStorage(base_dir=tmp_path, fail_count=1)
         storage.start_meeting("test-meeting", ["en"])
         assistant = FailingAssistant()
@@ -488,6 +488,10 @@ class TestFailureNote:
         assert len(turns) == 1
         assert turns[0]["role"] == "assistant"
         assert "Turn failed" in turns[0]["content"]
+
+        session_path = tmp_path / "meetings" / "test-meeting" / "session.md"
+        session_text = session_path.read_text()
+        assert session_text.count("Turn failed") == 1
 
 
 class TestShutdown:
