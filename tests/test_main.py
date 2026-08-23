@@ -9,7 +9,7 @@ from src.transcript import Transcript
 
 
 def _make_session(*, transcript, storage, assistant, audio_thread, capture,
-                  input_fn=lambda _: "", output_fn=lambda _: None):
+                  input_fn=lambda _: "", output_fn=lambda _: None, hud=None):
     """Wire a MeetingSession around a real Conversation, mirroring _build_session."""
     conversation = Conversation(transcript=transcript, storage=storage, assistant=assistant)
     return MeetingSession(
@@ -19,6 +19,7 @@ def _make_session(*, transcript, storage, assistant, audio_thread, capture,
         capture=capture,
         input_fn=input_fn,
         output_fn=output_fn,
+        hud=hud,
     )
 
 
@@ -168,6 +169,27 @@ class FakeSession:
 
     def run_input_loop(self):
         self.input_loop_ran = True
+
+
+class FakeHud:
+    """Records turn lifecycle calls and stop() for MeetingSession tests."""
+
+    def __init__(self, **kwargs):
+        self.turn_started_calls: list[None] = []
+        self.turn_finished_calls: list[bool] = []
+        self.stopped = False
+
+    def run(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def turn_started(self) -> None:
+        self.turn_started_calls.append(None)
+
+    def turn_finished(self, ok: bool) -> None:
+        self.turn_finished_calls.append(ok)
 
 
 class TestHotkeyCallback:
@@ -394,6 +416,130 @@ class TestShutdown:
         assert len(turns) == 2  # the question turn was recorded and finalized
 
 
+class TestHudLifecycle:
+    """MeetingSession signals turn start/finish to the injected HUD."""
+
+    def test_hotkey_turn_signals_hud(self, tmp_path):
+        transcript = Transcript()
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        assistant = FakeAssistant()
+        hud = FakeHud()
+
+        session = _make_session(
+            transcript=transcript,
+            storage=storage,
+            assistant=assistant,
+            audio_thread=FakeAudioThread(),
+            capture=FakeCapture(),
+            hud=hud,
+        )
+        session.start()
+        session.on_hotkey(b"\x89PNG fake")
+        session.stop()
+
+        assert hud.turn_started_calls == [None]
+        assert hud.turn_finished_calls == [True]
+
+    def test_question_turn_signals_hud(self, tmp_path):
+        transcript = Transcript()
+        transcript.append("latest speech")
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        assistant = FakeAssistant()
+        hud = FakeHud()
+
+        session = _make_session(
+            transcript=transcript,
+            storage=storage,
+            assistant=assistant,
+            audio_thread=FakeAudioThread(),
+            capture=FakeCapture(),
+            hud=hud,
+        )
+        session.start()
+        session.on_question("What does this mean?")
+        session.stop()
+
+        assert hud.turn_started_calls == [None]
+        assert hud.turn_finished_calls == [True]
+
+    def test_failed_turn_signals_finished_false(self, tmp_path):
+        class FailingAssistant:
+            def explain_slide(self, *, image_bytes: bytes, delta: str) -> str:
+                raise RuntimeError("model unreachable")
+
+            def ask_question(self, *, text: str, delta: str) -> str:
+                return "ok"
+
+        transcript = Transcript()
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        assistant = FailingAssistant()
+        hud = FakeHud()
+
+        session = _make_session(
+            transcript=transcript,
+            storage=storage,
+            assistant=assistant,
+            audio_thread=FakeAudioThread(),
+            capture=FakeCapture(),
+            hud=hud,
+        )
+        session.start()
+        session.on_hotkey(b"\x89PNG fake")
+        # After the hotkey failure, a subsequent question should still work.
+        session.on_question("Can you retry?")
+        session.stop()
+
+        assert hud.turn_started_calls == [None, None]
+        assert hud.turn_finished_calls == [False, True]
+
+    def test_input_loop_eof_stops_hud(self, tmp_path):
+        def fake_input(prompt=""):
+            raise EOFError()
+
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        hud = FakeHud()
+
+        session = _make_session(
+            transcript=Transcript(),
+            storage=storage,
+            assistant=FakeAssistant(),
+            audio_thread=FakeAudioThread(),
+            capture=FakeCapture(),
+            input_fn=fake_input,
+            hud=hud,
+        )
+        session.run_input_loop()
+
+        assert hud.stopped is True
+        assert session._shutdown.is_set()
+
+    def test_input_loop_keyboard_interrupt_stops_hud(self, tmp_path):
+        def fake_input(prompt=""):
+            raise KeyboardInterrupt()
+
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-meeting", ["en"])
+        hud = FakeHud()
+
+        session = _make_session(
+            transcript=Transcript(),
+            storage=storage,
+            assistant=FakeAssistant(),
+            audio_thread=FakeAudioThread(),
+            capture=FakeCapture(),
+            input_fn=fake_input,
+            hud=hud,
+        )
+        session.run_input_loop()
+
+        assert hud.stopped is True
+        assert session._shutdown.is_set()
+
+
 class TestMain:
     def test_main_prints_ready_when_config_loads(self, tmp_path, monkeypatch, capsys):
         monkeypatch.chdir(tmp_path)
@@ -411,6 +557,7 @@ class TestMain:
             },
         )
         monkeypatch.setattr("src.main._build_session", lambda *args, **kwargs: fake_session)
+        monkeypatch.setattr("src.main.HudPanel", FakeHud)
 
         exit_code = main()
 

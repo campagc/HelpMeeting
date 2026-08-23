@@ -17,6 +17,7 @@ import queue
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import load, MissingApiKeyError, format_hotkeys
+from src.hud import HudPanel, NullHud
 
 
 def _list_monitors():
@@ -85,6 +86,7 @@ class MeetingSession:
         capture,
         input_fn=input,
         output_fn=print,
+        hud=None,
     ):
         self._conversation = conversation
         self._storage = storage
@@ -92,6 +94,7 @@ class MeetingSession:
         self._capture = capture
         self._input_fn = input_fn
         self._output_fn = output_fn
+        self._hud = hud if hud is not None else NullHud()
         self._print_lock = threading.Lock()
         self._task_queue = queue.Queue()
         self._worker_thread = threading.Thread(
@@ -149,6 +152,8 @@ class MeetingSession:
             try:
                 question = self._input_fn("Question: ")
             except (EOFError, KeyboardInterrupt):
+                self._shutdown.set()
+                self._hud.stop()
                 break
             if self._shutdown.is_set():
                 break
@@ -157,10 +162,12 @@ class MeetingSession:
 
     def on_hotkey(self, png_bytes: bytes) -> None:
         """Queue a slide-explanation turn."""
+        self._hud.turn_started()
         self._task_queue.put(("explain", png_bytes))
 
     def on_question(self, text: str) -> None:
         """Queue a question-and-answer turn."""
+        self._hud.turn_started()
         self._task_queue.put(("question", text))
 
     # ------------------------------------------------------------------
@@ -173,13 +180,17 @@ class MeetingSession:
             if item is None:
                 break
             task_type, payload = item
+            ok = True
             try:
                 if task_type == "explain":
                     self._do_explain(payload)
                 elif task_type == "question":
                     self._do_question(payload)
             except Exception as exc:  # noqa: BLE001
+                ok = False
                 self._safe_print(f"[Error processing turn: {exc}]")
+            finally:
+                self._hud.turn_finished(ok)
 
     def _do_explain(self, png_bytes: bytes) -> None:
         explanation = self._conversation.explain(png_bytes)
@@ -214,7 +225,7 @@ def resolve_audio_device(devices, preferred_name: str = _AUDIO_DEVICE_NAME) -> i
     )
 
 
-def _build_session(config, settings, *, input_fn=input, output_fn=print):
+def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=print):
     """Wire the real dependencies into a MeetingSession."""
     import sounddevice as sd
     from google import genai
@@ -261,6 +272,7 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
         capture=None,  # set below after wiring the hotkey callback
         input_fn=input_fn,
         output_fn=output_fn,
+        hud=hud if hud is not None else NullHud(),
     )
     capture = Capture(
         callback=session.on_hotkey,
@@ -279,21 +291,27 @@ def main():
         return 1
 
     settings = prompt_settings()
-    session = _build_session(config, settings)
+    hud = HudPanel(monitor_index=settings["monitor_index"])
+    session = _build_session(config, settings, hud=hud)
 
     print(f"HelpMeeting ready: {settings['label']}")
     print(f"  spoken: {settings['spoken_language']}, explanation: {settings['explanation_language']}")
     print(f"  display: {settings['monitor_index']}")
     print(f"Press {format_hotkeys(config.hotkeys)} to request an explanation, Ctrl+C to stop.")
 
-    # Rely on the default SIGINT handler: Ctrl+C raises KeyboardInterrupt into
-    # the blocking input() call, which run_input_loop catches to exit cleanly.
+    # The question loop must yield the main thread to AppKit/NSApplication.
+    # Ctrl+C is handled by the HUD's interpreter-pump timer, not by input().
     session.start()
+    input_thread = threading.Thread(
+        target=session.run_input_loop, daemon=True, name="QuestionInput"
+    )
+    input_thread.start()
     try:
-        session.run_input_loop()
+        hud.run()
     except KeyboardInterrupt:
         pass
     finally:
+        hud.stop()
         print("\nShutting down and saving the meeting…")
         session.stop()
         print("Done.")
