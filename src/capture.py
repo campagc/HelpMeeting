@@ -113,5 +113,6 @@ class Capture:
             monitor = sct.monitors[self._monitor_index]
             shot = sct.grab(monitor)
             png_bytes = self._to_png(shot.rgb, shot.size)
-        assert png_bytes is not None
+        if png_bytes is None:
+            raise RuntimeError("PNG conversion returned no bytes")
         self._callback(png_bytes)

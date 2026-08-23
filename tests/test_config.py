@@ -43,13 +43,10 @@ class TestConfig:
 
 class TestFormatHotkeys:
     def test_formats_single_hotkey(self):
-        assert format_hotkeys(["<ctrl>+<alt>+<space>"]) == "Control+Option+Space"
+        assert format_hotkeys([HOTKEYS[0]]) == "Control+Option+Space"
 
     def test_formats_multiple_hotkeys_with_or(self):
-        assert (
-            format_hotkeys(["<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"])
-            == "Control+Option+Space or Control+Option+S"
-        )
+        assert format_hotkeys(HOTKEYS) == "Control+Option+Space or Control+Option+S"
 
     def test_formats_arbitrary_character_keys(self):
         assert format_hotkeys(["<ctrl>+<alt>+x"]) == "Control+Option+X"

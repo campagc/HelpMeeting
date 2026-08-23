@@ -17,6 +17,9 @@ import src.capture as _capture_module
 from src.capture import Capture
 
 
+TEST_HOTKEYS = ["<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"]
+
+
 # ---------------------------------------------------------------------------
 # Fake collaborators
 # ---------------------------------------------------------------------------
@@ -89,7 +92,7 @@ class FakeGlobalHotKeys:
         pass
 
 
-class FakeKeyboard:
+class FakeKeyboardModule:
     """Drop-in replacement for the pynput keyboard module used by capture."""
 
     GlobalHotKeys = FakeGlobalHotKeys
@@ -213,14 +216,14 @@ class TestMultipleHotkeys:
             clock=FakeClock(),
             mss_factory=lambda: FakeMss(),
             to_png=fake_to_png,
-            hotkeys=["<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"],
+            hotkeys=TEST_HOTKEYS,
         )
-        monkeypatch.setattr(_capture_module, "keyboard", FakeKeyboard)
+        monkeypatch.setattr(_capture_module, "keyboard", FakeKeyboardModule)
 
         capture.start()
 
         bound = capture._listener.hotkeys
-        assert set(bound.keys()) == {"<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"}
+        assert set(bound.keys()) == set(TEST_HOTKEYS)
         assert len(set(bound.values())) == 1
 
     def test_press_on_either_hotkey_drops_within_shared_debounce(self, monkeypatch):
@@ -233,20 +236,20 @@ class TestMultipleHotkeys:
             clock=clock,
             mss_factory=lambda: FakeMss(),
             to_png=fake_to_png,
-            hotkeys=["<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"],
+            hotkeys=TEST_HOTKEYS,
         )
-        monkeypatch.setattr(_capture_module, "keyboard", FakeKeyboard)
+        monkeypatch.setattr(_capture_module, "keyboard", FakeKeyboardModule)
 
         capture.start()
         mapping = capture._listener.hotkeys
 
-        mapping["<ctrl>+<alt>+<space>"]()  # t=0 → fires
+        mapping[TEST_HOTKEYS[0]]()  # t=0 → fires
         clock.advance(0.5)
-        mapping["<ctrl>+<alt>+s"]()        # t=0.5 → within debounce → dropped
+        mapping[TEST_HOTKEYS[1]]()  # t=0.5 → within debounce → dropped
 
         assert len(fired) == 1
 
         clock.advance(2.1)
-        mapping["<ctrl>+<alt>+s"]()        # t=2.6 → outside window → fires again
+        mapping[TEST_HOTKEYS[1]]()  # t=2.6 → outside window → fires again
 
         assert len(fired) == 2
