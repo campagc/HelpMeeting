@@ -113,6 +113,5 @@ class Capture:
             monitor = sct.monitors[self._monitor_index]
             shot = sct.grab(monitor)
             png_bytes = self._to_png(shot.rgb, shot.size)
-        if png_bytes is None:
-            return
+        assert png_bytes is not None
         self._callback(png_bytes)
