@@ -14,11 +14,13 @@ manually, not in unit tests.
 """
 
 import time as _time_module
-from typing import Callable
+from typing import Any, Callable
 
 import mss
 import mss.tools
 from pynput import keyboard
+
+from src.config import HOTKEYS
 
 
 # ---------------------------------------------------------------------------
@@ -50,9 +52,9 @@ class Capture:
         Callable returning an mss context-manager.  Injectable for tests.
     to_png:
         Callable ``(rgb, size) -> bytes``.  Injectable for tests.
-    hotkey:
-        Key combination string understood by ``pynput.keyboard.HotKey``
-        (e.g. ``"<ctrl>+<alt>+<space>"``).
+    hotkeys:
+        List of pynput key-combination strings, all mapped to the same
+        ``trigger()``.  Shared debouncing falls out of using one trigger.
     """
 
     def __init__(
@@ -62,17 +64,19 @@ class Capture:
         debounce_seconds: float = _DEFAULT_DEBOUNCE,
         *,
         clock: Callable[[], float] | None = None,
-        mss_factory: Callable | None = None,
-        to_png: Callable | None = None,
-        hotkey: str = "<ctrl>+<alt>+<space>",
+        mss_factory: Callable[[], Any] | None = None,
+        to_png: Callable[..., bytes | None] | None = None,
+        hotkeys: list[str] | None = None,
     ):
         self._callback = callback
         self._monitor_index = monitor_index
         self._debounce = debounce_seconds
         self._clock = clock if clock is not None else _time_module.monotonic
         self._mss_factory = mss_factory if mss_factory is not None else mss.MSS
-        self._to_png = to_png if to_png is not None else mss.tools.to_png
-        self._hotkey_str = hotkey
+        self._to_png: Callable[..., bytes | None] = (
+            to_png if to_png is not None else mss.tools.to_png
+        )
+        self._hotkeys = hotkeys if hotkeys is not None else HOTKEYS
         self._last_trigger: float = -debounce_seconds  # allow first press immediately
         self._listener: keyboard.GlobalHotKeys | None = None
 
@@ -90,7 +94,7 @@ class Capture:
 
     def start(self) -> None:
         """Start the global hotkey listener (blocks until stop() is called)."""
-        hotkeys = {self._hotkey_str: self.trigger}
+        hotkeys = {hk: self.trigger for hk in self._hotkeys}
         self._listener = keyboard.GlobalHotKeys(hotkeys)
         self._listener.start()
         self._listener.join()
@@ -109,4 +113,6 @@ class Capture:
             monitor = sct.monitors[self._monitor_index]
             shot = sct.grab(monitor)
             png_bytes = self._to_png(shot.rgb, shot.size)
+        if png_bytes is None:
+            return
         self._callback(png_bytes)

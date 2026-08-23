@@ -418,6 +418,7 @@ class TestMain:
         assert exit_code == 0
         assert "ready" in captured.out.lower()
         assert "Control+Option+Space" in captured.out
+        assert "Control+Option+S" in captured.out
         assert fake_session.started is True
         assert fake_session.input_loop_ran is True
         assert fake_session.stopped is True

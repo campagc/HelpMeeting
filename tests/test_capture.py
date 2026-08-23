@@ -13,6 +13,7 @@ The capture module accepts injected collaborators so tests never touch the OS.
 """
 import pytest
 
+import src.capture as _capture_module
 from src.capture import Capture
 
 
@@ -70,6 +71,28 @@ class FakeShot:
 def fake_to_png(rgb, size) -> bytes:
     """Stand-in for mss.tools.to_png — just return whatever rgb was."""
     return rgb
+
+
+class FakeGlobalHotKeys:
+    """Records the hotkey map passed to pynput without starting a real listener."""
+
+    def __init__(self, hotkeys):
+        self.hotkeys = hotkeys
+
+    def start(self):
+        pass
+
+    def join(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+class FakeKeyboard:
+    """Drop-in replacement for the pynput keyboard module used by capture."""
+
+    GlobalHotKeys = FakeGlobalHotKeys
 
 
 # ---------------------------------------------------------------------------
@@ -175,3 +198,55 @@ class TestDisplayDefault:
         capture.trigger()
 
         assert fake_mss.grabbed[0] == fake_mss.monitors[1]
+
+
+# ---------------------------------------------------------------------------
+# Multiple hotkeys map to the same trigger and share one debounce window
+# ---------------------------------------------------------------------------
+
+class TestMultipleHotkeys:
+    def test_binds_both_hotkeys_to_same_trigger(self, monkeypatch):
+        capture = Capture(
+            callback=lambda _: None,
+            monitor_index=1,
+            debounce_seconds=2.0,
+            clock=FakeClock(),
+            mss_factory=lambda: FakeMss(),
+            to_png=fake_to_png,
+            hotkeys=["<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"],
+        )
+        monkeypatch.setattr(_capture_module, "keyboard", FakeKeyboard)
+
+        capture.start()
+
+        bound = capture._listener.hotkeys
+        assert set(bound.keys()) == {"<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"}
+        assert len(set(bound.values())) == 1
+
+    def test_press_on_either_hotkey_drops_within_shared_debounce(self, monkeypatch):
+        clock = FakeClock(start=0.0)
+        fired: list[bytes] = []
+        capture = Capture(
+            callback=fired.append,
+            monitor_index=1,
+            debounce_seconds=2.0,
+            clock=clock,
+            mss_factory=lambda: FakeMss(),
+            to_png=fake_to_png,
+            hotkeys=["<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"],
+        )
+        monkeypatch.setattr(_capture_module, "keyboard", FakeKeyboard)
+
+        capture.start()
+        mapping = capture._listener.hotkeys
+
+        mapping["<ctrl>+<alt>+<space>"]()  # t=0 → fires
+        clock.advance(0.5)
+        mapping["<ctrl>+<alt>+s"]()        # t=0.5 → within debounce → dropped
+
+        assert len(fired) == 1
+
+        clock.advance(2.1)
+        mapping["<ctrl>+<alt>+s"]()        # t=2.6 → outside window → fires again
+
+        assert len(fired) == 2

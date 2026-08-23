@@ -16,7 +16,7 @@ import queue
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import load, MissingApiKeyError
+from src.config import load, MissingApiKeyError, format_hotkeys
 
 
 def _list_monitors():
@@ -262,7 +262,11 @@ def _build_session(config, settings, *, input_fn=input, output_fn=print):
         input_fn=input_fn,
         output_fn=output_fn,
     )
-    capture = Capture(callback=session.on_hotkey, monitor_index=settings["monitor_index"])
+    capture = Capture(
+        callback=session.on_hotkey,
+        monitor_index=settings["monitor_index"],
+        hotkeys=config.hotkeys,
+    )
     session._capture = capture
     return session
 
@@ -280,7 +284,7 @@ def main():
     print(f"HelpMeeting ready: {settings['label']}")
     print(f"  spoken: {settings['spoken_language']}, explanation: {settings['explanation_language']}")
     print(f"  display: {settings['monitor_index']}")
-    print(f"Press {config.hotkey} to request an explanation, Ctrl+C to stop.")
+    print(f"Press {format_hotkeys(config.hotkeys)} to request an explanation, Ctrl+C to stop.")
 
     # Rely on the default SIGINT handler: Ctrl+C raises KeyboardInterrupt into
     # the blocking input() call, which run_input_loop catches to exit cleanly.

@@ -1,6 +1,6 @@
 import pytest
 
-from src.config import load, MissingApiKeyError
+from src.config import load, MissingApiKeyError, format_hotkeys, HOTKEYS
 
 
 class TestConfig:
@@ -14,7 +14,7 @@ class TestConfig:
 
         assert config.api_key == "test-key"
         assert config.system_prompt == "You are a helpful assistant."
-        assert config.hotkey == "Control+Option+Space"
+        assert config.hotkeys == HOTKEYS
         # base downloads reliably and runs fast on CPU
         assert config.whisper_model_size == "base"
 
@@ -39,3 +39,17 @@ class TestConfig:
 
         prompt.write_text("Updated persona.")
         assert load(dotenv_path=dotenv, system_prompt_path=prompt).system_prompt == "Updated persona."
+
+
+class TestFormatHotkeys:
+    def test_formats_single_hotkey(self):
+        assert format_hotkeys(["<ctrl>+<alt>+<space>"]) == "Control+Option+Space"
+
+    def test_formats_multiple_hotkeys_with_or(self):
+        assert (
+            format_hotkeys(["<ctrl>+<alt>+<space>", "<ctrl>+<alt>+s"])
+            == "Control+Option+Space or Control+Option+S"
+        )
+
+    def test_formats_arbitrary_character_keys(self):
+        assert format_hotkeys(["<ctrl>+<alt>+x"]) == "Control+Option+X"
