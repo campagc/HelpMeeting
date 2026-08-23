@@ -70,7 +70,13 @@ class Storage:
         content: str,
         slide_path: str | None = None,
     ) -> None:
-        """Append a turn to history.json and session.md."""
+        """Append a turn to history.json and session.md.
+
+        If either write fails, the turn is removed from the in-memory list and
+        history.json is best-effort restored to its previous state. Callers
+        that need a guaranteed note (e.g. the worker failure path) can retry
+        without creating duplicate entries.
+        """
         self._assert_started()
 
         turn: dict = {"role": role, "content": content}
@@ -78,8 +84,20 @@ class Storage:
             turn["slide_path"] = slide_path
 
         self._turns.append(turn)
-        self._flush_history()
-        self._append_session_md(turn)
+        try:
+            self._flush_history()
+            self._append_session_md(turn)
+        except Exception:  # noqa: BLE001
+            # Rollback the in-memory list so a later successful record_turn
+            # cannot write this phantom turn to history.json.
+            if self._turns and self._turns[-1] is turn:
+                self._turns.pop()
+            # Best-effort restore the previous history.json state.
+            try:
+                self._flush_history()
+            except Exception:
+                pass
+            raise
 
     def finalize(self) -> None:
         """Flush all state cleanly, leaving no half-written files."""

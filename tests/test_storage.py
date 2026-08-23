@@ -193,3 +193,61 @@ class TestStorage:
         for turn in turns:
             assert "role" in turn
             assert "content" in turn
+
+
+class TestStorageRecordTurnRollback:
+    def test_record_turn_reverts_history_json_if_flush_fails(self, tmp_path):
+        """A failed flush must not leave a phantom turn in history.json."""
+
+        class FlakyStorage(Storage):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._fail_count = 1
+
+            def _flush_history(self) -> None:
+                if self._fail_count > 0:
+                    self._fail_count -= 1
+                    raise OSError("disk full")
+                super()._flush_history()
+
+        storage = FlakyStorage(base_dir=tmp_path)
+        storage.start_meeting("2026-06-25_14-00_standup", langs=["en"])
+
+        with pytest.raises(OSError):
+            storage.record_turn(role="assistant", content="lost note")
+
+        # A later successful record should find no leftover phantom note.
+        storage.record_turn(role="user", content="kept note")
+
+        history_path = tmp_path / "meetings" / "2026-06-25_14-00_standup" / "history.json"
+        turns = json.loads(history_path.read_text())
+        assert len(turns) == 1
+        assert turns[0]["role"] == "user"
+        assert turns[0]["content"] == "kept note"
+
+    def test_record_turn_reverts_history_json_if_append_session_md_fails(self, tmp_path):
+        """A failed session.md append must also revert history.json."""
+
+        class FlakyStorage(Storage):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._fail = True
+
+            def _append_session_md(self, turn) -> None:
+                if self._fail:
+                    self._fail = False
+                    raise OSError("session.md full")
+                super()._append_session_md(turn)
+
+        storage = FlakyStorage(base_dir=tmp_path)
+        storage.start_meeting("2026-06-25_14-00_standup", langs=["en"])
+
+        with pytest.raises(OSError):
+            storage.record_turn(role="assistant", content="lost note")
+
+        storage.record_turn(role="user", content="kept note")
+
+        history_path = tmp_path / "meetings" / "2026-06-25_14-00_standup" / "history.json"
+        turns = json.loads(history_path.read_text())
+        assert len(turns) == 1
+        assert turns[0]["role"] == "user"

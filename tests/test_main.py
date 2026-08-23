@@ -233,6 +233,20 @@ class BrokenStorage(Storage):
         raise OSError("disk full")
 
 
+class FlakyStorage(Storage):
+    """Storage whose _flush_history fails the first N calls, then succeeds."""
+
+    def __init__(self, *args, fail_count: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._fail_count = fail_count
+
+    def _flush_history(self) -> None:
+        if self._fail_count > 0:
+            self._fail_count -= 1
+            raise OSError("disk full")
+        super()._flush_history()
+
+
 class TestHotkeyCallback:
     def test_explain_slide_called_and_turn_persisted(self, tmp_path):
         transcript = Transcript()
@@ -448,6 +462,32 @@ class TestFailureNote:
 
         assert any("pipeline broke" in line for line in outputs)
         assert hud.turn_finished_calls == [False]
+
+    def test_failed_turn_leaves_exactly_one_archive_note(self, tmp_path):
+        """If the conversation's failure note cannot be flushed, the worker's
+        best-effort note must not be a duplicate."""
+        storage = FlakyStorage(base_dir=tmp_path, fail_count=1)
+        storage.start_meeting("test-meeting", ["en"])
+        assistant = FailingAssistant()
+        audio_thread = FakeAudioThread()
+        capture = FakeCapture()
+
+        session = _make_session(
+            transcript=Transcript(),
+            storage=storage,
+            assistant=assistant,
+            audio_thread=audio_thread,
+            capture=capture,
+        )
+        session.start()
+        session.on_hotkey(b"\x89PNG fake")
+        session.stop()
+
+        history_path = tmp_path / "meetings" / "test-meeting" / "history.json"
+        turns = json.loads(history_path.read_text())
+        assert len(turns) == 1
+        assert turns[0]["role"] == "assistant"
+        assert "Turn failed" in turns[0]["content"]
 
 
 class TestShutdown:
