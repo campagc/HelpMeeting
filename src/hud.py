@@ -6,7 +6,7 @@ hud = NullHud()                    # no visible panel
 hud.run()                          # blocks the main thread
 hud.stop()                         # stops the run loop
 hud.turn_started()                 # show the Thinking badge
-hud.turn_finished(ok)              # hide the badge (single-turn slice)
+hud.turn_finished(ok)              # show the Outcome badge, then dismiss it
 
 hud = HudPanel(monitor_index=1)    # real AppKit panel
 hud.run()                          # runs NSApplication on the main thread
@@ -16,11 +16,16 @@ The panel is non-activating, floats above the menu bar, follows the user into
 full-screen Spaces, ignores mouse events, and is excluded from mss screenshots
 via NSWindowSharingNone.  If AppKit or the panel fails to initialise, the HUD
 degrades to the non-AppKit fallback so the meeting continues.
+
+The HUD owns the panel and the dismiss timer; all queue-correct badge logic
+lives in the pure ``feedback`` module.
 """
 
 import threading
 import weakref
 from typing import Any, Mapping, Protocol
+
+from src.feedback import BadgeKind, Feedback
 
 # mss gives the actual display the attendee chose for screenshots.  NSScreen may
 # order displays differently, so we anchor the badge to the mss monitor.
@@ -96,8 +101,8 @@ if _APPKIT_AVAILABLE:
         """Small dispatch target that lives on the main thread.
 
         Holds a weak reference back to the HudPanel so it can call the
-        Python-level show/hide helpers.  Also serves as the repeating
-        interpreter-pump timer target.
+        Python-level turn lifecycle and expiry helpers.  Also serves as the
+        repeating interpreter-pump timer target.
         """
 
         _hud_ref: Any = None
@@ -109,15 +114,29 @@ if _APPKIT_AVAILABLE:
             self._hud_ref = weakref.ref(hud)  # type: ignore[attr-defined]
             return self
 
-        def showThinking_(self, _obj: Any) -> None:
+        def turnStarted_(self, _obj: Any) -> None:
             hud = self._hud_ref()  # type: ignore[attr-defined]
             if hud is not None:
-                hud._show_thinking()
+                hud._on_turn_started()
 
-        def hide_(self, _obj: Any) -> None:
+        def turnFinished_(self, ok: Any) -> None:
             hud = self._hud_ref()  # type: ignore[attr-defined]
             if hud is not None:
-                hud._hide()
+                if isinstance(ok, bool):
+                    bool_ok = ok
+                else:
+                    bool_ok = ok.boolValue() if ok is not None else True
+                hud._on_turn_finished(bool_ok)
+
+        def expire_(self, _obj: Any) -> None:
+            hud = self._hud_ref()  # type: ignore[attr-defined]
+            if hud is not None:
+                hud._on_outcome_expired()
+
+        def stop_(self, _obj: Any) -> None:
+            hud = self._hud_ref()  # type: ignore[attr-defined]
+            if hud is not None:
+                hud._on_stop()
 
         def tick_(self, _timer: Any) -> None:
             # Load-bearing: this timer hands control back to the Python
@@ -135,6 +154,8 @@ if _APPKIT_AVAILABLE:
 class Hud(Protocol):
     """Collaborator interface for the on-screen feedback window."""
 
+    window_id: int | None
+
     def run(self) -> None:
         """Block the calling thread until stop() is called."""
         ...
@@ -144,11 +165,11 @@ class Hud(Protocol):
         ...
 
     def turn_started(self) -> None:
-        """A turn has been enqueued; show the Thinking badge."""
+        """A turn has been enqueued; the badge should switch to Thinking."""
         ...
 
     def turn_finished(self, ok: bool) -> None:
-        """A turn has resolved; hide the badge in this slice."""
+        """A turn has resolved; the badge should briefly show the Outcome."""
         ...
 
 
@@ -273,14 +294,17 @@ class NullHud(_BaseHud):
     it falls back to a plain threading.Event so the app still functions.
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.window_id: int | None = None
+
     def turn_started(self) -> None:
         """No-op in the null implementation."""
         pass
 
     def turn_finished(self, ok: bool) -> None:
         """No-op in the null implementation."""
-        # 'ok' is part of the protocol but not used until the Outcome badge
-        # slice.  The parameter is intentionally unused in this slice.
+        _ = ok
         pass
 
 
@@ -289,23 +313,29 @@ class NullHud(_BaseHud):
 # ---------------------------------------------------------------------------
 
 class HudPanel(_BaseHud):
-    """A small non-activating floating panel that shows the Thinking badge.
+    """A small non-activating floating panel that renders the current badge.
 
     The panel is created on the main thread and all badge updates are
     marshalled to the main thread internally, so callers never see AppKit.
+    The dismiss timer is owned here; the queue-correct state machine lives in
+    ``src.feedback``.
     """
 
     _PANEL_WIDTH = 120
     _PANEL_HEIGHT = 36
     _PANEL_PADDING = 12
 
-    def __init__(self, monitor_index: int = 1) -> None:
+    def __init__(self, monitor_index: int = 1, outcome_seconds: float = 1.5) -> None:
         super().__init__()
         self._monitor_index = monitor_index
+        self._outcome_seconds = outcome_seconds
         self._monitor, self._main_height = self._load_geometry()
+        self._feedback = Feedback()
         self._panel: Any | None = None
         self._label: Any | None = None
         self._bridge: Any | None = None
+        self._outcome_timer: Any | None = None
+        self._window_id: int | None = None
 
         if self._appkit_available() and threading.current_thread() is threading.main_thread():
             try:
@@ -318,35 +348,36 @@ class HudPanel(_BaseHud):
     # Public interface
     # ------------------------------------------------------------------
 
+    @property
+    def window_id(self) -> int | None:
+        """Return the panel's cached window number, or None before it is created."""
+        return self._window_id
+
     def stop(self) -> None:
-        """Signal the run loop to exit and hide the panel."""
+        """Signal the run loop to exit and clear the panel."""
         super().stop()
-        if self._bridge is not None:
-            try:
-                self._bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    "hide:", None, False
-                )
-            except Exception:
-                pass
+        self._call_on_main("stop_", "stop:")
 
     def turn_started(self) -> None:
         """Show the Thinking badge on the main thread."""
-        self._call_on_main("showThinking_", "showThinking:")
+        self._call_on_main("turnStarted_", "turnStarted:")
 
     def turn_finished(self, ok: bool) -> None:
-        """Hide the badge on the main thread (single-turn slice).
+        """Show the Outcome badge on the main thread.
 
-        'ok' is not used in this slice; the Outcome badge slice will use it.
+        The badge is green for a successful turn, red for a failed one, and
+        dismisses itself after ``outcome_seconds``.
         """
-        _ = ok
-        self._call_on_main("hide_", "hide:")
+        if not self._appkit_available():
+            return
+        self._call_on_main("turnFinished_", "turnFinished:", ok)
 
     # ------------------------------------------------------------------
     # Implementation
     # ------------------------------------------------------------------
 
     def _prepare_appkit(self) -> None:
-        """Create the bridge before the run loop starts, if it wasn't already."""
+        """Create the bridge before the run loop starts, if it was not already."""
         if self._bridge is not None:
             return
         try:
@@ -355,25 +386,101 @@ class HudPanel(_BaseHud):
             self._bridge = None
 
     def _after_run_loop(self) -> None:
-        """Hide the panel when the run loop exits."""
+        """Hide the panel and tear down the outcome timer when the run loop exits."""
+        self._cancel_outcome_timer()
         self._hide()
 
-    def _call_on_main(self, py_method: str, objc_selector: str) -> None:
+    def _call_on_main(self, py_method: str, objc_selector: str, obj: Any = None) -> None:
         """Call a bridge method, either directly or via the main run loop."""
         if not self._appkit_available() or self._bridge is None:
             return
         if threading.current_thread() is threading.main_thread():
             try:
-                getattr(self._bridge, py_method)(None)
+                getattr(self._bridge, py_method)(obj)
             except Exception:
                 pass
         else:
             try:
                 self._bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    objc_selector, None, False
+                    objc_selector, obj, False
                 )
             except Exception:
                 pass
+
+    def _on_turn_started(self) -> None:
+        """Update the state machine and render the current badge."""
+        self._feedback.turn_started()
+        self._render()
+
+    def _on_turn_finished(self, ok: bool) -> None:
+        """Update the state machine and render the Outcome badge."""
+        self._feedback.turn_finished(ok)
+        self._render()
+
+    def _on_outcome_expired(self) -> None:
+        """The Outcome badge interval has elapsed; move to the next state."""
+        self._outcome_timer = None
+        self._feedback.expire()
+        self._render()
+
+    def _on_stop(self) -> None:
+        """Cancel the dismiss timer and hide the panel."""
+        self._cancel_outcome_timer()
+        self._hide()
+
+    def _render(self) -> None:
+        """Query the state machine and display whatever badge it reports."""
+        badge = self._feedback.current_badge()
+
+        if badge is None:
+            self._hide()
+            self._cancel_outcome_timer()
+            return
+
+        self._ensure_panel()
+        assert self._panel is not None
+        assert self._label is not None
+
+        if badge.kind is BadgeKind.THINKING:
+            self._label.setStringValue_("Thinking")
+            self._label.setBackgroundColor_(NSColor.blackColor())
+            self._label.setTextColor_(NSColor.whiteColor())
+            self._panel.orderFront_(None)
+        elif badge.kind is BadgeKind.OUTCOME:
+            if badge.success:
+                text = "\u2713 Done"
+                color = NSColor.greenColor()
+            else:
+                text = "\u2717 Failed"
+                color = NSColor.redColor()
+            self._label.setStringValue_(text)
+            self._label.setBackgroundColor_(color)
+            self._label.setTextColor_(NSColor.whiteColor())
+            self._panel.orderFront_(None)
+
+        self._cancel_outcome_timer()
+        if badge.kind is BadgeKind.OUTCOME:
+            self._schedule_outcome_timer()
+
+    def _cancel_outcome_timer(self) -> None:
+        """Invalidate any pending Outcome badge dismiss timer."""
+        if self._outcome_timer is not None:
+            try:
+                self._outcome_timer.invalidate()
+            except Exception:
+                pass
+            self._outcome_timer = None
+
+    def _schedule_outcome_timer(self) -> None:
+        """Schedule the timer that will expire the current Outcome badge."""
+        if not self._appkit_available() or _Bridge is None:
+            return
+        try:
+            self._outcome_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                self._outcome_seconds, self._bridge, "expire:", None, False
+            )
+        except Exception:
+            pass
 
     def _load_geometry(self) -> tuple[Mapping[str, int] | None, int]:
         """Return the selected mss monitor and the main display height.
@@ -483,20 +590,7 @@ class HudPanel(_BaseHud):
         panel.setContentView_(label)
         self._panel = panel
         self._label = label
-
-    def _show_thinking(self) -> None:
-        """Create (if necessary) and show the Thinking badge."""
-        try:
-            if self._panel is None:
-                self._ensure_panel()
-            if self._label is not None:
-                self._label.setStringValue_("Thinking")
-            if self._panel is not None:
-                self._panel.orderFront_(None)
-        except Exception:
-            # A failed panel is not worth crashing the meeting over.
-            self._panel = None
-            self._label = None
+        self._window_id = panel.windowNumber()
 
     def _hide(self) -> None:
         """Hide the panel, if one exists."""
@@ -506,3 +600,4 @@ class HudPanel(_BaseHud):
         except Exception:
             self._panel = None
             self._label = None
+            self._window_id = None

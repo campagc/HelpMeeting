@@ -1,16 +1,17 @@
-"""Tests for the capture module (issue #7).
+"""Tests for the capture module (issue #7/#15).
 
-Hardware-bound behaviour (actual hotkey listener, real mss grabs) is validated
+Hardware-bound behaviour (actual hotkey listener, real screen grab) is validated
 manually.  Everything that lives above the hardware boundary is tested here:
 
   - Debounce: a second trigger arriving within the debounce window is dropped.
   - Debounce: a trigger arriving after the window fires the callback.
-  - Screenshot bytes: the callback receives raw PNG bytes taken from the
-    startup-selected monitor.
+  - Screenshot bytes: the callback receives raw PNG bytes from the grabber.
   - Display default: when no monitor index is given, monitor 1 is used.
+  - HUD exclusion: the grabber receives the HUD window number when supplied.
 
 The capture module accepts injected collaborators so tests never touch the OS.
 """
+
 import pytest
 
 import src.capture as _capture_module
@@ -37,50 +38,33 @@ class FakeClock:
         self._t += seconds
 
 
-class FakeMss:
-    """Minimal stand-in for an mss context manager.
+class FakeScreen:
+    """Records grab calls and returns a fixed PNG payload."""
 
-    monitors[0] is the combined virtual display (mss convention);
-    monitors[1] is the first physical display.
-    """
-
-    def __init__(self, monitors=None, png_bytes=b"\x89PNG fake"):
-        self.monitors = monitors or [
-            {"left": 0, "top": 0, "width": 2880, "height": 900},   # combined
-            {"left": 0, "top": 0, "width": 1440, "height": 900},   # display 1
-            {"left": 1440, "top": 0, "width": 1440, "height": 900}, # display 2
-        ]
+    def __init__(self, png_bytes: bytes = b"\x89PNG fake"):
         self._png_bytes = png_bytes
-        self.grabbed: list[dict] = []  # records which monitor dicts were grabbed
+        self.calls: list[tuple[int, int | None]] = []
 
-    def grab(self, monitor: dict) -> "FakeShot":
-        self.grabbed.append(monitor)
-        return FakeShot(self._png_bytes)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        pass
+    def grab(self, monitor_index: int, below_window: int | None = None) -> bytes:
+        self.calls.append((monitor_index, below_window))
+        return self._png_bytes
 
 
-class FakeShot:
-    def __init__(self, png_bytes: bytes):
-        self._png_bytes = png_bytes
-        self.rgb = png_bytes          # not real RGB but enough for the fake
-        self.size = (1440, 900)
+class FakeHud:
+    """HUD collaborator that exposes a window number."""
 
-
-def fake_to_png(rgb, size) -> bytes:
-    """Stand-in for mss.tools.to_png — just return whatever rgb was."""
-    return rgb
+    def __init__(self, window_id: int | None = None):
+        self.window_id = window_id
 
 
 class FakeGlobalHotKeys:
     """Records the hotkey map passed to pynput without starting a real listener."""
 
+    instances: list["FakeGlobalHotKeys"] = []
+
     def __init__(self, hotkeys):
         self.hotkeys = hotkeys
+        self.instances.append(self)
 
     def start(self):
         pass
@@ -111,8 +95,7 @@ class TestDebounce:
             monitor_index=1,
             debounce_seconds=2.0,
             clock=clock,
-            mss_factory=lambda: FakeMss(),
-            to_png=fake_to_png,
+            grabber=FakeScreen(),
         )
 
         capture.trigger()           # t=0 → fires
@@ -129,8 +112,7 @@ class TestDebounce:
             monitor_index=1,
             debounce_seconds=2.0,
             clock=clock,
-            mss_factory=lambda: FakeMss(),
-            to_png=fake_to_png,
+            grabber=FakeScreen(),
         )
 
         capture.trigger()           # t=0 → fires
@@ -141,21 +123,20 @@ class TestDebounce:
 
 
 # ---------------------------------------------------------------------------
-# Screenshot bytes come from the selected monitor
+# Screenshot bytes come from the injected grabber
 # ---------------------------------------------------------------------------
 
 class TestScreenshot:
     def test_callback_receives_png_bytes_from_selected_monitor(self):
         clock = FakeClock()
         received: list[bytes] = []
-        fake_mss = FakeMss(png_bytes=b"\x89PNG real-fake")
+        fake_screen = FakeScreen(png_bytes=b"\x89PNG real-fake")
         capture = Capture(
             callback=received.append,
             monitor_index=1,
             debounce_seconds=2.0,
             clock=clock,
-            mss_factory=lambda: fake_mss,
-            to_png=fake_to_png,
+            grabber=fake_screen,
         )
 
         capture.trigger()
@@ -163,22 +144,20 @@ class TestScreenshot:
         assert len(received) == 1
         assert received[0] == b"\x89PNG real-fake"
 
-    def test_correct_monitor_dict_is_grabbed(self):
+    def test_correct_monitor_index_is_grabbed(self):
         clock = FakeClock()
-        fake_mss = FakeMss()
+        fake_screen = FakeScreen()
         capture = Capture(
             callback=lambda _: None,
             monitor_index=2,
             debounce_seconds=2.0,
             clock=clock,
-            mss_factory=lambda: fake_mss,
-            to_png=fake_to_png,
+            grabber=fake_screen,
         )
 
         capture.trigger()
 
-        assert len(fake_mss.grabbed) == 1
-        assert fake_mss.grabbed[0] == fake_mss.monitors[2]
+        assert fake_screen.calls == [(2, None)]
 
 
 # ---------------------------------------------------------------------------
@@ -188,19 +167,53 @@ class TestScreenshot:
 class TestDisplayDefault:
     def test_default_monitor_index_is_one(self):
         clock = FakeClock()
-        fake_mss = FakeMss()
+        fake_screen = FakeScreen()
         # Omit monitor_index — should default to 1
         capture = Capture(
             callback=lambda _: None,
             debounce_seconds=2.0,
             clock=clock,
-            mss_factory=lambda: fake_mss,
-            to_png=fake_to_png,
+            grabber=fake_screen,
         )
 
         capture.trigger()
 
-        assert fake_mss.grabbed[0] == fake_mss.monitors[1]
+        assert fake_screen.calls[0][0] == 1
+
+
+# ---------------------------------------------------------------------------
+# HUD exclusion
+# ---------------------------------------------------------------------------
+
+class TestHudExclusion:
+    def test_hud_window_id_is_passed_to_grabber(self):
+        fake_screen = FakeScreen()
+        capture = Capture(
+            callback=lambda _: None,
+            monitor_index=1,
+            debounce_seconds=2.0,
+            clock=FakeClock(),
+            grabber=fake_screen,
+            hud=FakeHud(window_id=12345),
+        )
+
+        capture.trigger()
+
+        assert fake_screen.calls == [(1, 12345)]
+
+    def test_no_hud_means_below_window_is_none(self):
+        fake_screen = FakeScreen()
+        capture = Capture(
+            callback=lambda _: None,
+            monitor_index=1,
+            debounce_seconds=2.0,
+            clock=FakeClock(),
+            grabber=fake_screen,
+        )
+
+        capture.trigger()
+
+        assert fake_screen.calls == [(1, None)]
 
 
 # ---------------------------------------------------------------------------
@@ -208,21 +221,24 @@ class TestDisplayDefault:
 # ---------------------------------------------------------------------------
 
 class TestMultipleHotkeys:
+    def setup_method(self):
+        FakeGlobalHotKeys.instances.clear()
+
     def test_binds_both_hotkeys_to_same_trigger(self, monkeypatch):
         capture = Capture(
             callback=lambda _: None,
             monitor_index=1,
             debounce_seconds=2.0,
             clock=FakeClock(),
-            mss_factory=lambda: FakeMss(),
-            to_png=fake_to_png,
+            grabber=FakeScreen(),
             hotkeys=TEST_HOTKEYS,
         )
         monkeypatch.setattr(_capture_module, "keyboard", FakeKeyboardModule)
 
         capture.start()
 
-        bound = capture._listener.hotkeys
+        listener = FakeGlobalHotKeys.instances[-1]
+        bound = listener.hotkeys
         assert set(bound.keys()) == set(TEST_HOTKEYS)
         assert len(set(bound.values())) == 1
 
@@ -234,14 +250,14 @@ class TestMultipleHotkeys:
             monitor_index=1,
             debounce_seconds=2.0,
             clock=clock,
-            mss_factory=lambda: FakeMss(),
-            to_png=fake_to_png,
+            grabber=FakeScreen(),
             hotkeys=TEST_HOTKEYS,
         )
         monkeypatch.setattr(_capture_module, "keyboard", FakeKeyboardModule)
 
         capture.start()
-        mapping = capture._listener.hotkeys
+        listener = FakeGlobalHotKeys.instances[-1]
+        mapping = listener.hotkeys
 
         mapping[TEST_HOTKEYS[0]]()  # t=0 → fires
         clock.advance(0.5)

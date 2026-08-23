@@ -281,6 +281,7 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
         callback=session.on_hotkey,
         monitor_index=settings["monitor_index"],
         hotkeys=config.hotkeys,
+        hud=hud,
     )
     session._capture = capture
     return session
@@ -294,7 +295,10 @@ def main():
         return 1
 
     settings = prompt_settings()
-    hud = HudPanel(monitor_index=settings["monitor_index"])
+    hud = HudPanel(
+        monitor_index=settings["monitor_index"],
+        outcome_seconds=config.outcome_badge_seconds,
+    )
     session = _build_session(config, settings, hud=hud)
 
     print(f"HelpMeeting ready: {settings['label']}")

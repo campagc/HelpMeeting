@@ -110,6 +110,7 @@ class _FakePanelAlloc:
 
 class FakeNSPanel:
     instances: list["FakeNSPanel"] = []
+    _next_window_number = 1000
 
     def __init__(self):
         self.level = None
@@ -122,6 +123,8 @@ class FakeNSPanel:
         self.content_view = None
         self.is_visible = False
         self.is_closed = False
+        self.window_number = FakeNSPanel._next_window_number
+        FakeNSPanel._next_window_number += 1
 
     @classmethod
     def alloc(cls):
@@ -160,6 +163,9 @@ class FakeNSPanel:
     def close(self):
         self.is_closed = True
         self.is_visible = False
+
+    def windowNumber(self):
+        return self.window_number
 
 
 class FakeLabel:
@@ -266,6 +272,13 @@ class FakeTimer:
     def invalidate(self):
         self.invalidated = True
 
+    def fire(self):
+        """Simulate a one-shot timer firing on the run loop."""
+        if self.target is None or self.selector is None:
+            return
+        method_name = self.selector.replace(":", "_")
+        getattr(self.target, method_name)(self.user_info)
+
 
 class FakeNSTimer:
     @classmethod
@@ -313,7 +326,7 @@ class FakeMSSModule:
 
 
 class TestHudPanel:
-    """HudPanel creates an AppKit panel and shows/hides a Thinking badge."""
+    """HudPanel creates an AppKit panel and renders Thinking and Outcome badges."""
 
     def setup_method(self):
         FakeNSPanel.instances.clear()
@@ -333,6 +346,7 @@ class TestHudPanel:
         assert panel.is_visible is True
         assert panel.content_view is not None
         assert panel.content_view.string == "Thinking"
+        assert hud.window_id == panel.window_number
 
         assert panel.style_mask == (
             AppKit.NSHUDWindowMask | AppKit.NSNonactivatingPanelMask
@@ -356,7 +370,7 @@ class TestHudPanel:
         assert label.bordered is False
         assert label.alignment == AppKit.NSCenterTextAlignment
 
-    def test_turn_finished_hides_panel(self, monkeypatch):
+    def test_turn_finished_success_shows_green_done_badge(self, monkeypatch):
         monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
 
@@ -365,6 +379,77 @@ class TestHudPanel:
         panel = FakeNSPanel.instances[-1]
 
         hud.turn_finished(True)
+
+        assert panel.is_visible is True
+        assert panel.content_view.string == "\u2713 Done"
+        assert panel.content_view.background_color is AppKit.NSColor.greenColor()
+
+    def test_turn_finished_failure_shows_red_failed_badge(self, monkeypatch):
+        monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
+        monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
+
+        hud = HudPanel(monitor_index=1)
+        hud.turn_started()
+        panel = FakeNSPanel.instances[-1]
+
+        hud.turn_finished(False)
+
+        assert panel.is_visible is True
+        assert panel.content_view.string == "\u2717 Failed"
+        assert panel.content_view.background_color is AppKit.NSColor.redColor()
+
+    def test_outcome_badge_dismisses_after_interval(self, monkeypatch):
+        monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
+        monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
+        monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
+
+        hud = HudPanel(monitor_index=1)
+        hud.turn_started()
+        panel = FakeNSPanel.instances[-1]
+
+        hud.turn_finished(True)
+
+        assert panel.is_visible is True
+        assert panel.content_view.string == "\u2713 Done"
+
+        assert len(FakeTimer.instances) == 1
+        timer = FakeTimer.instances[-1]
+        assert timer.selector == "expire:"
+        assert timer.repeats is False
+        assert timer.interval == 1.5
+
+        timer.fire()
+
+        assert panel.is_visible is False
+
+    def test_outcome_badge_returns_to_thinking_when_queue_not_empty(self, monkeypatch):
+        monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
+        monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
+        monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
+
+        hud = HudPanel(monitor_index=1)
+
+        # Two turns are started; the first finishes while the second is still queued.
+        hud.turn_started()
+        hud.turn_started()
+        panel = FakeNSPanel.instances[-1]
+
+        hud.turn_finished(True)
+        assert panel.content_view.string == "\u2713 Done"
+
+        first_timer = FakeTimer.instances[-1]
+        first_timer.fire()
+
+        assert panel.is_visible is True
+        assert panel.content_view.string == "Thinking"
+        assert panel.content_view.background_color is AppKit.NSColor.blackColor()
+
+        # The second turn finishes and its Outcome badge dismisses, leaving nothing.
+        hud.turn_finished(False)
+        assert panel.content_view.string == "\u2717 Failed"
+
+        second_timer = FakeTimer.instances[-1]
+        second_timer.fire()
 
         assert panel.is_visible is False
 
@@ -425,13 +510,20 @@ class TestHudPanel:
     def test_turn_started_and_finished_are_safe_before_run(self, monkeypatch):
         monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
+        monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
 
         hud = HudPanel(monitor_index=1)
         # turn_started/turn_finished may be called before run() starts.
         hud.turn_started()
         hud.turn_finished(True)
 
-        # No real window should have been created and the panel fake should
-        # show the intended lifecycle (visible then hidden).
+        # The panel shows the green Outcome badge and, once its timer fires,
+        # dismisses itself — all without a real run loop running.
         panel = FakeNSPanel.instances[-1]
+        assert panel.is_visible is True
+        assert panel.content_view.string == "\u2713 Done"
+
+        timer = FakeTimer.instances[-1]
+        timer.fire()
+
         assert panel.is_visible is False

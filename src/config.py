@@ -18,6 +18,8 @@ AUDIO_CHUNK_SECONDS = 10
 # on CPU; raise to "small"/"medium" if jargon is garbled and the full weights
 # are present in the HF cache.
 WHISPER_MODEL_SIZE = "base"
+# How long the Outcome badge (green/red) lingers before dismissing itself.
+OUTCOME_BADGE_SECONDS = 1.5
 MEETINGS_DIR = "meetings"
 SYSTEM_PROMPT_PATH = Path("system_prompt.md")
 DOTENV_PATH = Path(".env")
@@ -29,6 +31,7 @@ class Config:
     gemini_model_name: str
     audio_chunk_seconds: int
     whisper_model_size: str
+    outcome_badge_seconds: float
     meetings_dir: str
     api_key: str
     system_prompt: str
@@ -47,6 +50,7 @@ def load(dotenv_path=DOTENV_PATH, system_prompt_path=SYSTEM_PROMPT_PATH):
         gemini_model_name=GEMINI_MODEL_NAME,
         audio_chunk_seconds=AUDIO_CHUNK_SECONDS,
         whisper_model_size=WHISPER_MODEL_SIZE,
+        outcome_badge_seconds=OUTCOME_BADGE_SECONDS,
         meetings_dir=MEETINGS_DIR,
         api_key=api_key,
         system_prompt=system_prompt,

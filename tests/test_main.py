@@ -178,6 +178,7 @@ class FakeHud:
         self.turn_started_calls: list[None] = []
         self.turn_finished_calls: list[bool] = []
         self.stopped = False
+        self.window_id = None
 
     def run(self) -> None:
         pass

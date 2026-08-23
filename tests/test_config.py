@@ -17,6 +17,7 @@ class TestConfig:
         assert config.hotkeys == HOTKEYS
         # base downloads reliably and runs fast on CPU
         assert config.whisper_model_size == "base"
+        assert config.outcome_badge_seconds == 1.5
 
     def test_load_raises_clear_error_when_api_key_missing(self, tmp_path, monkeypatch):
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
