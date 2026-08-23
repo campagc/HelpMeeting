@@ -343,9 +343,9 @@ class HudPanel(_BaseHud):
     ``src.feedback``.
     """
 
-    _PANEL_SIZE = 28
+    _PANEL_SIZE = 32
     _PANEL_PADDING = 12
-    _GLYPH_POINT_SIZE = 20.0
+    _GLYPH_POINT_SIZE = 22.0
 
     def __init__(self, monitor_index: int = 1, outcome_seconds: float = 1.5) -> None:
         super().__init__()
