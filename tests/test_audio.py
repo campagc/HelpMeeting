@@ -1,13 +1,14 @@
 """Tests for the audio module — chunk accumulation, silence detection, and restart logic.
 
-All tests use a FakeTranscriber instead of WhisperModel, and drive the core
-accumulation / silence / transcription loop via AudioThread._run_chunk_loop
-directly, without opening a real sd.InputStream.
+Tests inject fakes at the transcription and system-playback seams. Core queue
+cases still drive AudioThread._run_chunk_loop directly, without opening real
+capture hardware.
 """
 
 import queue
 import threading
 import time
+from collections.abc import Callable
 from unittest.mock import patch
 
 import numpy as np
@@ -39,7 +40,51 @@ class FakeTranscriber:
         return self.return_text
 
 
-def _make_thread(tmp_path, transcriber=None, chunk_seconds: int = 1):
+class FakeSystemPlaybackSource:
+    description = "fake system playback"
+    silence_warning = "No audio detected on system playback."
+
+    def __init__(self, *, stop_error: Exception | None = None) -> None:
+        self.started = threading.Event()
+        self.restarted = threading.Event()
+        self.final_stop = threading.Event()
+        self.start_count = 0
+        self.stop_count = 0
+        self.stop_error = stop_error
+        self.stopped = False
+        self._on_block: Callable[[np.ndarray], None] | None = None
+        self._on_error: Callable[[Exception], None] | None = None
+
+    def prepare(self) -> None:
+        pass
+
+    def start(self, on_block, on_error) -> None:
+        self._on_block = on_block
+        self._on_error = on_error
+        self.start_count += 1
+        self.started.set()
+        if self.start_count == 2:
+            self.restarted.set()
+
+    def emit(self, block: np.ndarray) -> None:
+        assert self._on_block is not None
+        self._on_block(block)
+
+    def fail(self, error: Exception) -> None:
+        assert self._on_error is not None
+        self._on_error(error)
+
+    def stop(self) -> None:
+        self.stopped = True
+        self.stop_count += 1
+        if self.stop_error is not None:
+            error = self.stop_error
+            self.stop_error = None
+            raise error
+        self.final_stop.set()
+
+
+def _make_thread(tmp_path, transcriber=None, chunk_seconds: int = 1, source=None):
     """Wire a minimal AudioThread with an in-memory Transcript and tmp Storage."""
     transcript = Transcript()
     storage = Storage(base_dir=tmp_path)
@@ -47,6 +92,7 @@ def _make_thread(tmp_path, transcriber=None, chunk_seconds: int = 1):
     thread = AudioThread(
         transcript=transcript,
         storage=storage,
+        source=source if source is not None else FakeSystemPlaybackSource(),
         chunk_seconds=chunk_seconds,
         transcriber=transcriber,
     )
@@ -82,6 +128,79 @@ def _feed_and_run(thread: AudioThread, transcriber, blocks, *, join_timeout: flo
     thread._stop_event.set()
     runner.join(timeout=join_timeout)
     assert not runner.is_alive(), "chunk loop did not exit within timeout"
+
+
+# ---------------------------------------------------------------------------
+# Playback source
+# ---------------------------------------------------------------------------
+
+class TestSystemPlaybackSource:
+    def test_source_blocks_flow_through_shared_transcription(self, tmp_path):
+        source = FakeSystemPlaybackSource()
+        transcriber = FakeTranscriber("spoken text")
+        transcript = Transcript()
+        storage = Storage(base_dir=tmp_path)
+        storage.start_meeting("test-audio", ["en"])
+        thread = AudioThread(
+            transcript=transcript,
+            storage=storage,
+            source=source,
+            chunk_seconds=1,
+            transcriber=transcriber,
+        )
+
+        thread.start()
+        assert source.started.wait(timeout=1.0)
+        source.emit(np.full(_SAMPLE_RATE, 0.1, dtype="float32"))
+        deadline = time.monotonic() + 1.0
+        while not transcriber.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        thread.stop()
+
+        assert transcript.take_delta() == "spoken text"
+        assert source.stopped is True
+
+    def test_source_failure_uses_shared_restart_behavior(self, tmp_path):
+        source = FakeSystemPlaybackSource()
+        thread, _, _ = _make_thread(tmp_path, FakeTranscriber(), source=source)
+
+        with patch("src.audio.time.sleep", return_value=None):
+            thread.start()
+            assert source.started.wait(timeout=1.0)
+            source.fail(RuntimeError("device disconnected"))
+            assert source.restarted.wait(timeout=1.0)
+            thread.stop()
+
+        assert source.start_count == 2
+
+    def test_clean_stop_flushes_the_final_partial_chunk(self, tmp_path):
+        source = FakeSystemPlaybackSource()
+        transcriber = FakeTranscriber("final words")
+        thread, transcript, _ = _make_thread(tmp_path, transcriber, source=source)
+
+        thread.start()
+        assert source.started.wait(timeout=1.0)
+        source.emit(np.full(_SAMPLE_RATE // 2, 0.1, dtype="float32"))
+        time.sleep(0.1)
+        thread.stop()
+
+        assert len(transcriber.calls) == 1
+        assert transcript.take_delta() == "final words"
+
+    def test_stop_waits_for_final_flush_when_source_stop_raises(self, tmp_path):
+        source = FakeSystemPlaybackSource(stop_error=RuntimeError("stop failed"))
+        transcriber = FakeTranscriber("final words")
+        thread, transcript, _ = _make_thread(tmp_path, transcriber, source=source)
+
+        thread.start()
+        assert source.started.wait(timeout=1.0)
+        source.emit(np.full(_SAMPLE_RATE // 2, 0.1, dtype="float32"))
+        time.sleep(0.1)
+        with pytest.raises(RuntimeError, match="stop failed"):
+            thread.stop()
+
+        assert source.final_stop.is_set()
+        assert transcript.take_delta() == "final words"
 
 
 # ---------------------------------------------------------------------------

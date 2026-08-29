@@ -198,35 +198,15 @@ class MeetingSession:
             self._output_fn(message)
 
 
-_AUDIO_DEVICE_NAME = "BlackHole"
-
-
-def resolve_audio_device(devices, preferred_name: str = _AUDIO_DEVICE_NAME) -> int:
-    """Return the index of the input device whose name contains preferred_name.
-
-    System audio is captured via BlackHole, but device indices shift whenever
-    other devices connect/disconnect, so we must match by name rather than a
-    fixed index.
-    """
-    for index, device in enumerate(devices):
-        if preferred_name.lower() in device["name"].lower():
-            return index
-    raise RuntimeError(
-        f"No '{preferred_name}' audio device found. Install BlackHole and route "
-        f"system audio through a Multi-Output Device. Available devices: "
-        f"{[d['name'] for d in devices]}"
-    )
-
-
 def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=print):
     """Wire the real dependencies into a MeetingSession."""
-    import sounddevice as sd
     from google import genai
 
     from src.audio import AudioThread
     from src.assistant import Assistant
     from src.capture import Capture
     from src.storage import Storage
+    from src.system_playback import BlackHoleSource
     from src.transcript import Transcript
     from src.turn import Turn
 
@@ -241,17 +221,18 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
         system_prompt=config.system_prompt,
     )
 
-    device_index = resolve_audio_device(sd.query_devices())
-    output_fn(f"Capturing audio from device {device_index}: {sd.query_devices(device_index)['name']}")
     audio_log = storage.meeting_dir / "audio_debug.log" if storage.meeting_dir else None
+    source = BlackHoleSource(log_path=audio_log)
+    source.prepare()
+    output_fn(f"Capturing audio from {source.description}")
     if audio_log is not None:
         output_fn(f"Audio diagnostics: {audio_log}")
     audio_thread = AudioThread(
         transcript=transcript,
         storage=storage,
+        source=source,
         chunk_seconds=config.audio_chunk_seconds,
         language=settings["spoken_language"],
-        device=device_index,
         model_size=config.whisper_model_size,
         log_path=audio_log,
     )

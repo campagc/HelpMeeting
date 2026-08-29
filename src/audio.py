@@ -5,9 +5,9 @@ Public interface
 thread = AudioThread(
     transcript=transcript,
     storage=storage,
+    source=system_playback_source,
     chunk_seconds=10,
     language="en",
-    device=0,
     model_size="small",
 )
 thread.start()   # non-blocking; returns immediately
@@ -20,12 +20,11 @@ import time
 from typing import Protocol
 
 import numpy as np
-import sounddevice as sd
 from faster_whisper import WhisperModel
 
-_SAMPLE_RATE = 16_000       # Hz — Whisper expects 16 kHz mono
-_CHANNELS = 1
-_CALLBACK_BLOCK = 1024      # frames per PortAudio callback invocation
+from src.system_playback import SAMPLE_RATE, SystemPlaybackSource
+
+_SAMPLE_RATE = SAMPLE_RATE
 _SILENCE_RMS = 1e-4         # below this a chunk is treated as silence
 _SILENCE_WARN_AFTER = 2     # warn after this many consecutive silent chunks
 
@@ -72,18 +71,18 @@ class AudioThread:
         *,
         transcript,
         storage,
+        source: SystemPlaybackSource,
         chunk_seconds: int = 10,
         language: str = "en",
-        device: int | str | None = 0,
         model_size: str = "small",
         log_path=None,
         transcriber: Transcriber | None = None,
     ):
         self._transcript = transcript
         self._storage = storage
+        self._source = source
         self._chunk_seconds = chunk_seconds
         self._language = language
-        self._device = device
         self._model_size = model_size
         self._log_path = log_path
         self._transcriber = transcriber
@@ -119,7 +118,10 @@ class AudioThread:
     def stop(self) -> None:
         """Signal the thread to stop and block until it exits."""
         self._stop_event.set()
-        self._thread.join()
+        try:
+            self._source.stop()
+        finally:
+            self._thread.join()
 
     # ------------------------------------------------------------------
     # Restart-on-exception outer loop
@@ -130,7 +132,7 @@ class AudioThread:
         import traceback
 
         self._log(
-            f"thread start | device={self._device} model={self._model_size} "
+            f"thread start | source={self._source.description} model={self._model_size} "
             f"chunk_seconds={self._chunk_seconds} language={self._language}"
         )
         while not self._stop_event.is_set():
@@ -149,7 +151,7 @@ class AudioThread:
     # ------------------------------------------------------------------
 
     def _capture_loop(self) -> None:
-        """Open the audio stream and transcribe each complete ~chunk_seconds window
+        """Consume source blocks and transcribe each complete ~chunk_seconds window
         until _stop_event is set."""
         transcriber = self._transcriber
         if transcriber is None:
@@ -159,31 +161,12 @@ class AudioThread:
                 log_fn=self._log,
             )
 
-        audio_queue: queue.Queue[np.ndarray] = queue.Queue()
-        callback_count = 0
-
-        def _callback(indata: np.ndarray, frames: int, time_info, status) -> None:
-            """PortAudio callback — runs in a separate C thread."""
-            nonlocal callback_count
-            callback_count += 1
-            if status:
-                self._log(f"stream status flag: {status}")
-            chunk = indata[:, 0].copy()  # flatten to mono
-            audio_queue.put(chunk)
-
-        with sd.InputStream(
-            samplerate=_SAMPLE_RATE,
-            channels=_CHANNELS,
-            dtype="float32",
-            device=self._device,
-            blocksize=_CALLBACK_BLOCK,
-            callback=_callback,
-        ):
-            self._log(
-                f"InputStream open (samplerate={_SAMPLE_RATE} channels={_CHANNELS} "
-                f"blocksize={_CALLBACK_BLOCK}); waiting for audio…"
-            )
+        audio_queue: queue.Queue[np.ndarray | Exception] = queue.Queue()
+        self._source.start(audio_queue.put, audio_queue.put)
+        try:
             remaining = self._run_chunk_loop(audio_queue, transcriber)
+        finally:
+            self._source.stop()
 
         # Flush any remaining audio that did not fill a full chunk.
         if remaining:
@@ -199,7 +182,7 @@ class AudioThread:
 
     def _run_chunk_loop(
         self,
-        audio_queue: "queue.Queue[np.ndarray]",
+        audio_queue: "queue.Queue[np.ndarray | Exception]",
         transcriber: Transcriber,
     ) -> "list[np.ndarray]":
         """Accumulate audio blocks, detect silence, and transcribe complete chunks.
@@ -219,6 +202,8 @@ class AudioThread:
                 block = audio_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if isinstance(block, Exception):
+                raise block
 
             accumulator.append(block)
             accumulated_frames += len(block)
@@ -236,18 +221,13 @@ class AudioThread:
                     f"rms={rms:.6f} peak={peak:.6f}"
                 )
 
-                # Warn once if the meeting audio is not reaching us — a common
-                # setup mistake (system output not routed into BlackHole).
+                # Warn once if system playback is not reaching transcription.
                 if rms < _SILENCE_RMS:
                     silent_chunks += 1
                     if silent_chunks >= _SILENCE_WARN_AFTER and not warned_silent:
                         warned_silent = True
                         self._log("SILENCE detected — audio is not reaching the device")
-                        print(
-                            "[AudioThread] No audio detected on the capture device. "
-                            "Is your system output routed to BlackHole "
-                            "(e.g. via a Multi-Output Device)?"
-                        )
+                        print(f"[AudioThread] {self._source.silence_warning}")
                     continue
                 silent_chunks = 0
                 warned_silent = False

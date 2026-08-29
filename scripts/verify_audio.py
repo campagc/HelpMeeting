@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import sounddevice as sd
 
-from src.main import resolve_audio_device
+from src.system_playback import resolve_audio_device
 
 _SAMPLE_RATE = 16_000
 

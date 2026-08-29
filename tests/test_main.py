@@ -1,9 +1,7 @@
 import json
 
-import pytest
-
 from src.assistant import AssistantUnavailable
-from src.main import main, prompt_settings, MeetingSession, resolve_audio_device
+from src.main import main, prompt_settings, MeetingSession
 from src.storage import Storage
 from src.turn import Turn, TurnResult
 from src.transcript import Transcript
@@ -22,36 +20,6 @@ def _make_session(*, transcript, storage, assistant, audio_thread, capture,
         output_fn=output_fn,
         hud=hud,
     )
-
-
-class TestResolveAudioDevice:
-    """The meeting audio comes from BlackHole; we must find it by name because
-    device indices shift whenever other audio devices connect/disconnect."""
-
-    DEVICES = [
-        {"name": "iPhone di Giuliano Microphone", "max_input_channels": 1},
-        {"name": "BlackHole 2ch", "max_input_channels": 2},
-        {"name": "MacBook Air Microphone", "max_input_channels": 1},
-        {"name": "MacBook Air Speakers", "max_input_channels": 0},
-    ]
-
-    def test_finds_blackhole_by_name_not_index_zero(self):
-        assert resolve_audio_device(self.DEVICES) == 1
-
-    def test_match_is_case_insensitive_and_substring(self):
-        devices = [
-            {"name": "Some Mic", "max_input_channels": 1},
-            {"name": "blackhole 16ch", "max_input_channels": 16},
-        ]
-        assert resolve_audio_device(devices) == 1
-
-    def test_raises_clear_error_when_blackhole_absent(self):
-        devices = [
-            {"name": "MacBook Air Microphone", "max_input_channels": 1},
-            {"name": "MacBook Air Speakers", "max_input_channels": 0},
-        ]
-        with pytest.raises(RuntimeError, match="BlackHole"):
-            resolve_audio_device(devices)
 
 
 class TestPromptSettings:
