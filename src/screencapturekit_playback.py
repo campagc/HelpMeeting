@@ -1,4 +1,4 @@
-"""Direct ScreenCaptureKit system-playback source spike."""
+"""Direct ScreenCaptureKit system-playback source."""
 
 import threading
 from collections.abc import Callable

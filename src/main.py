@@ -206,7 +206,7 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
     from src.assistant import Assistant
     from src.capture import Capture
     from src.storage import Storage
-    from src.system_playback import BlackHoleSource
+    from src.system_playback import default_system_playback_source
     from src.transcript import Transcript
     from src.turn import Turn
 
@@ -222,7 +222,7 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
     )
 
     audio_log = storage.meeting_dir / "audio_debug.log" if storage.meeting_dir else None
-    source = BlackHoleSource(log_path=audio_log)
+    source = default_system_playback_source()
     source.prepare()
     output_fn(f"Capturing audio from {source.description}")
     if audio_log is not None:

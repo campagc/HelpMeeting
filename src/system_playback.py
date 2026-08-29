@@ -52,6 +52,12 @@ class SystemPlaybackSource(Protocol):
         ...
 
 
+def default_system_playback_source() -> SystemPlaybackSource:
+    from src.screencapturekit_playback import ScreenCaptureKitSource
+
+    return ScreenCaptureKitSource()
+
+
 def resolve_audio_device(
     devices: Sequence[Mapping[str, Any]], preferred_name: str = "BlackHole"
 ) -> int:

@@ -3,6 +3,11 @@ from collections.abc import Callable
 import numpy as np
 
 from src.screencapturekit_playback import ScreenCaptureKitSource
+from src.system_playback import default_system_playback_source
+
+
+def test_default_system_playback_source_uses_screencapturekit():
+    assert isinstance(default_system_playback_source(), ScreenCaptureKitSource)
 
 
 class FakeScreenCaptureKit:

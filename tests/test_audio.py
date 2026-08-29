@@ -20,6 +20,7 @@ from src.audio import (
     _SILENCE_RMS,
     _SILENCE_WARN_AFTER,
 )
+from src.screencapturekit_playback import ScreenCaptureKitSource
 from src.storage import Storage
 from src.transcript import Transcript
 
@@ -38,6 +39,28 @@ class FakeTranscriber:
     def transcribe(self, audio: np.ndarray) -> str:
         self.calls.append(audio.copy())
         return self.return_text
+
+
+class FakeScreenCaptureKitFramework:
+    format_summary = None
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self._on_samples: Callable[[np.ndarray], None] | None = None
+
+    def prepare(self) -> None:
+        pass
+
+    def start(self, on_samples, on_error) -> None:
+        self._on_samples = on_samples
+        self.started.set()
+
+    def emit(self, samples: np.ndarray) -> None:
+        assert self._on_samples is not None
+        self._on_samples(samples)
+
+    def stop(self) -> None:
+        pass
 
 
 class FakeSystemPlaybackSource:
@@ -135,6 +158,24 @@ def _feed_and_run(thread: AudioThread, transcriber, blocks, *, join_timeout: flo
 # ---------------------------------------------------------------------------
 
 class TestSystemPlaybackSource:
+    def test_screencapturekit_source_grows_transcript_through_shared_transcription(self, tmp_path):
+        native_capture = FakeScreenCaptureKitFramework()
+        source = ScreenCaptureKitSource(framework=native_capture)
+        transcriber = FakeTranscriber("captured speech")
+        thread, transcript, storage = _make_thread(tmp_path, transcriber, source=source)
+
+        thread.start()
+        assert native_capture.started.wait(timeout=1.0)
+        native_capture.emit(np.full(_SAMPLE_RATE, 0.1, dtype="float32"))
+        deadline = time.monotonic() + 1.0
+        while not transcriber.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        thread.stop()
+
+        assert transcript.take_delta() == "captured speech"
+        transcript_path = storage.meeting_dir / "transcript.txt"
+        assert transcript_path.read_text(encoding="utf-8") == "captured speech"
+
     def test_source_blocks_flow_through_shared_transcription(self, tmp_path):
         source = FakeSystemPlaybackSource()
         transcriber = FakeTranscriber("spoken text")
