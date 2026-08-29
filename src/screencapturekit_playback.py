@@ -381,15 +381,16 @@ class _PyObjCScreenCaptureKit:
 
     def _clear_stream_locked(self) -> None:
         stream = self._stream
+        delegate = self._delegate
         self._stream = None
         self._delegate = None
         self._sample_queue = None
         self._content = None
         self._filter = None
         self._configuration = None
-        if stream is not None:
+        if stream is not None and delegate is not None:
             stream.removeStreamOutput_type_error_(
-                stream, SCK.SCStreamOutputTypeAudio, None
+                delegate, SCK.SCStreamOutputTypeAudio, None
             )
 
 
