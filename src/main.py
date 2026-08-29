@@ -16,7 +16,6 @@ import queue
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.assistant import AssistantUnavailable
 from src.config import load, MissingApiKeyError, format_hotkeys
 from src.hud import HudPanel, NullHud
 
@@ -69,19 +68,18 @@ def prompt_settings(input_fn=input, output_fn=print, list_monitors_fn=_list_moni
 
 
 class MeetingSession:
-    """Wires the conversation, audio, capture, and storage modules into the live loop.
+    """Wires the Turn, audio, capture, and storage modules into the live loop.
 
     The capture object must be pre-configured with its own callback pointing at
     ``on_hotkey``.  This class owns the threads: audio transcription, capture
-    listener, and the assistant worker that processes hotkey / question turns.
-    Each queued turn is run through the ``conversation`` module, which owns the
-    turn's steps and their ordering.
+    listener, and the assistant worker that processes Explain and Question turns.
+    Each queued Turn is resolved through the Turn module.
     """
 
     def __init__(
         self,
         *,
-        conversation,
+        turn,
         storage,
         audio_thread,
         capture,
@@ -89,7 +87,7 @@ class MeetingSession:
         output_fn=print,
         hud=None,
     ):
-        self._conversation = conversation
+        self._turn = turn
         self._storage = storage
         self._audio_thread = audio_thread
         self._capture = capture
@@ -184,52 +182,16 @@ class MeetingSession:
             if item is None:
                 break
             task_type, payload = item
-            ok = True
-            result: str | None = None
-            try:
-                if task_type == "explain":
-                    result = self._do_explain(payload)
-                elif task_type == "question":
-                    result = self._do_question(payload)
-            except AssistantUnavailable as exc:
-                # The conversation module has already recorded the carried text
-                # as the assistant's turn. Surface it as the terminal error.
-                ok = False
-                self._safe_print(str(exc))
-            except Exception as exc:  # noqa: BLE001
-                # A non-assistant failure still leaves one short note in the
-                # archive so the gap is not unexplained.
-                ok = False
-                self._record_failure_note(exc)
-                self._safe_print(f"[Error processing turn: {exc}]")
+            if task_type == "explain":
+                result = self._turn.explain(payload)
             else:
-                # The turn succeeded; printing its result is not part of the
-                # turn's failure surface.
-                if result is not None:
-                    heading = "[Explanation]" if task_type == "explain" else "[Answer]"
-                    self._safe_print(f"\n{heading}\n{result}\n")
-            finally:
-                self._hud.turn_finished(ok)
-
-    def _record_failure_note(self, exc: Exception) -> None:
-        """Best-effort archive note for a pipeline failure.
-
-        The archive may itself be what broke, so a failure while writing the
-        note is swallowed rather than propagated.
-        """
-        try:
-            self._storage.record_turn(
-                role="assistant",
-                content=f"[Turn failed: {exc}]",
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _do_explain(self, png_bytes: bytes) -> str:
-        return self._conversation.explain(png_bytes)
-
-    def _do_question(self, question: str) -> str:
-        return self._conversation.ask(question)
+                result = self._turn.ask(payload)
+            if result.ok:
+                heading = "[Explanation]" if task_type == "explain" else "[Answer]"
+                self._safe_print(f"\n{heading}\n{result.text}\n")
+            else:
+                self._safe_print(result.text)
+            self._hud.turn_finished(result.ok)
 
     def _safe_print(self, message: str) -> None:
         with self._print_lock:
@@ -264,9 +226,9 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
     from src.audio import AudioThread
     from src.assistant import Assistant
     from src.capture import Capture
-    from src.conversation import Conversation
     from src.storage import Storage
     from src.transcript import Transcript
+    from src.turn import Turn
 
     transcript = Transcript()
     storage = Storage()
@@ -294,10 +256,10 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
         log_path=audio_log,
     )
 
-    conversation = Conversation(transcript=transcript, storage=storage, assistant=assistant)
+    turn = Turn(transcript=transcript, archive=storage, assistant=assistant)
 
     session = MeetingSession(
-        conversation=conversation,
+        turn=turn,
         storage=storage,
         audio_thread=audio_thread,
         capture=None,  # set below after wiring the hotkey callback
