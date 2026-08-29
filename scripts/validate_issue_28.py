@@ -46,7 +46,7 @@ def _run_pytest() -> tuple[bool, str]:
     print("Running automated test suite...", file=sys.stderr)
     started = time.monotonic()
     result = subprocess.run(
-        ["python", "-m", "pytest", "tests", "-q"],
+        [sys.executable, "-m", "pytest", "tests", "-q"],
         capture_output=True,
         text=True,
         cwd=Path(__file__).resolve().parent.parent,
