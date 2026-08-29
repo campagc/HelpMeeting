@@ -584,3 +584,58 @@ class TestMain:
         captured = capsys.readouterr()
         assert exit_code == 1
         assert "Missing GEMINI_API_KEY" in captured.err
+
+    def test_main_exits_cleanly_when_recording_permission_denied(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("GEMINI_API_KEY=test-key\n")
+        (tmp_path / "system_prompt.md").write_text("persona")
+
+        def fake_input(prompt=""):
+            return ""
+
+        def raise_permission(*args, **kwargs):
+            raise ScreenCapturePermissionError(
+                "Screen & System Audio Recording permission is required. "
+                "Grant it to your terminal in System Settings, then relaunch."
+            )
+
+        monkeypatch.setattr("src.main.prompt_settings", lambda **kwargs: {
+            "label": "test",
+            "spoken_language": "en",
+            "explanation_language": "en",
+            "monitor_index": 1,
+        })
+        monkeypatch.setattr("src.main._build_session", raise_permission)
+        monkeypatch.setattr("src.main.HudPanel", FakeHud)
+
+        exit_code = main()
+
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "Screen & System Audio Recording" in captured.err
+        assert "relaunch" in captured.err.lower()
+        assert "Traceback" not in (captured.out + captured.err)
+
+    def test_main_exits_cleanly_when_screen_capture_unavailable(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("GEMINI_API_KEY=test-key\n")
+        (tmp_path / "system_prompt.md").write_text("persona")
+
+        def raise_unavailable(*args, **kwargs):
+            raise RuntimeError("ScreenCaptureKit is not available on this macOS version.")
+
+        monkeypatch.setattr("src.main.prompt_settings", lambda **kwargs: {
+            "label": "test",
+            "spoken_language": "en",
+            "explanation_language": "en",
+            "monitor_index": 1,
+        })
+        monkeypatch.setattr("src.main._build_session", raise_unavailable)
+        monkeypatch.setattr("src.main.HudPanel", FakeHud)
+
+        exit_code = main()
+
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "not available" in captured.err
+        assert "Traceback" not in (captured.out + captured.err)

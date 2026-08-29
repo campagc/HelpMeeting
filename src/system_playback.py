@@ -63,7 +63,13 @@ def default_system_playback_source() -> SystemPlaybackSource:
             "Supported values: blackhole, screencapturekit"
         )
 
-    from src.screencapturekit_playback import ScreenCaptureKitSource
+    try:
+        from src.screencapturekit_playback import ScreenCaptureKitSource
+    except ImportError as exc:
+        raise RuntimeError(
+            "ScreenCaptureKit is not available on this macOS version. "
+            "HelpMeeting requires macOS 12.3 or later."
+        ) from None
 
     return ScreenCaptureKitSource()
 

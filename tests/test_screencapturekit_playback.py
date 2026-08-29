@@ -3,7 +3,11 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 
-from src.screencapturekit_playback import ScreenCaptureKitSource
+from src.screencapturekit_playback import (
+    QuartzScreenRecordingAccess,
+    ScreenCaptureKitSource,
+    ScreenCapturePermissionError,
+)
 from src.system_playback import BlackHoleSource, default_system_playback_source
 
 
@@ -113,3 +117,69 @@ def test_source_stop_is_idempotent():
     source.stop()
 
     assert framework.stop_count == 1
+
+
+class TestQuartzScreenRecordingAccess:
+    def test_granted_access_does_nothing_and_allows_success(self):
+        calls: list[str] = []
+
+        def preflight() -> bool:
+            return True
+
+        def request() -> None:
+            calls.append("request")
+
+        access = QuartzScreenRecordingAccess(preflight=preflight, request=request)
+        access.ensure_granted()
+
+        assert calls == []
+
+    def test_first_missing_access_requests_and_raises(self):
+        calls: list[str] = []
+
+        class FakeAccess:
+            def __init__(self):
+                self.granted = False
+
+            def preflight(self) -> bool:
+                return self.granted
+
+            def request(self) -> None:
+                calls.append("request")
+
+        fake = FakeAccess()
+        access = QuartzScreenRecordingAccess(preflight=fake.preflight, request=fake.request)
+
+        with pytest.raises(ScreenCapturePermissionError) as exc_info:
+            access.ensure_granted()
+
+        assert calls == ["request"]
+        assert "required" in str(exc_info.value)
+        assert "System Settings" in str(exc_info.value)
+
+    def test_second_call_does_not_request_again(self):
+        calls: list[str] = []
+
+        class FakeAccess:
+            def __init__(self):
+                self.granted = False
+
+            def preflight(self) -> bool:
+                return self.granted
+
+            def request(self) -> None:
+                calls.append("request")
+
+        fake = FakeAccess()
+        access = QuartzScreenRecordingAccess(preflight=fake.preflight, request=fake.request)
+
+        with pytest.raises(ScreenCapturePermissionError):
+            access.ensure_granted()
+
+        calls.clear()
+
+        with pytest.raises(ScreenCapturePermissionError) as exc_info:
+            access.ensure_granted()
+
+        assert calls == []
+        assert "still denied" in str(exc_info.value)

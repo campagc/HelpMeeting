@@ -88,6 +88,44 @@ class ScreenCapturePermissionError(RuntimeError):
     """Screen & System Audio Recording access is unavailable."""
 
 
+class ScreenRecordingAccess(Protocol):
+    """Injectable macOS Screen & System Audio Recording permission check."""
+
+    def ensure_granted(self) -> None:
+        """Return if already granted; otherwise request once and raise."""
+        ...
+
+
+class QuartzScreenRecordingAccess:
+    """Default Screen & System Audio Recording preflight/request."""
+
+    def __init__(
+        self,
+        *,
+        preflight: Callable[[], bool] | None = None,
+        request: Callable[[], None] | None = None,
+    ) -> None:
+        self._preflight = preflight if preflight is not None else Quartz.CGPreflightScreenCaptureAccess
+        self._request = request if request is not None else Quartz.CGRequestScreenCaptureAccess
+        self._requested = False
+
+    def ensure_granted(self) -> None:
+        if self._requested:
+            raise ScreenCapturePermissionError(
+                "Screen & System Audio Recording permission was requested and is still denied. "
+                "Grant it to your terminal in System Settings > Privacy & Security > "
+                "Screen & System Audio Recording, then relaunch."
+            )
+        if not self._preflight():
+            self._request()
+            self._requested = True
+            raise ScreenCapturePermissionError(
+                "Screen & System Audio Recording permission is required. Grant it to your "
+                "terminal in System Settings > Privacy & Security > Screen & System Audio "
+                "Recording, then relaunch."
+            )
+
+
 class ScreenCaptureKitFramework(Protocol):
     format_summary: str | None
 
@@ -211,7 +249,7 @@ class _StreamDelegate(
 class _PyObjCScreenCaptureKit:
     format_summary: str | None
 
-    def __init__(self) -> None:
+    def __init__(self, *, recording_access: ScreenRecordingAccess | None = None) -> None:
         self.format_summary = None
         self._content: Any = None
         self._filter: Any = None
@@ -220,15 +258,10 @@ class _PyObjCScreenCaptureKit:
         self._delegate: _StreamDelegate | None = None
         self._sample_queue: Any = None
         self._state_lock = threading.Lock()
+        self._recording_access = recording_access if recording_access is not None else QuartzScreenRecordingAccess()
 
     def prepare(self) -> None:
-        if not Quartz.CGPreflightScreenCaptureAccess():
-            Quartz.CGRequestScreenCaptureAccess()
-            raise ScreenCapturePermissionError(
-                "Screen & System Audio Recording permission is required. Grant it to your "
-                "terminal in System Settings > Privacy & Security > Screen & System Audio "
-                "Recording, then relaunch the diagnostic."
-            )
+        self._recording_access.ensure_granted()
 
         completed = threading.Event()
         result: dict[str, Any] = {}

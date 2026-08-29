@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import load, MissingApiKeyError, format_hotkeys
 from src.hud import HudPanel, NullHud
+from src.screencapturekit_playback import ScreenCapturePermissionError
 
 
 def _list_monitors():
@@ -271,7 +272,17 @@ def main():
         monitor_index=settings["monitor_index"],
         outcome_seconds=config.outcome_badge_seconds,
     )
-    session = _build_session(config, settings, hud=hud)
+    try:
+        session = _build_session(config, settings, hud=hud)
+    except ScreenCapturePermissionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"HelpMeeting cannot start: {exc}", file=sys.stderr)
+        return 1
 
     print(f"HelpMeeting ready: {settings['label']}")
     print(f"  spoken: {settings['spoken_language']}, explanation: {settings['explanation_language']}")
