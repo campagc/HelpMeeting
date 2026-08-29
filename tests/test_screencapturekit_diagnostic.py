@@ -66,7 +66,7 @@ def test_diagnostic_reports_signal_transcription_and_stable_output():
 
     report = "\n".join(output)
     assert result == 0
-    assert "Source: ScreenCaptureKit test source" in report
+    assert "Selected source: ScreenCaptureKit test source" in report
     assert "Requested duration: 1s" in report
     assert "RMS=0.250000" in report
     assert "peak=0.250000" in report

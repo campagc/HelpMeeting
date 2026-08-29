@@ -106,6 +106,8 @@ class ScreenCaptureKitSource:
 
     def __init__(self, *, framework: ScreenCaptureKitFramework | None = None) -> None:
         self._framework = framework if framework is not None else _PyObjCScreenCaptureKit()
+        self._state_lock = threading.Lock()
+        self._running = False
 
     @property
     def description(self) -> str:
@@ -113,7 +115,10 @@ class ScreenCaptureKitSource:
 
     @property
     def silence_warning(self) -> str:
-        return "No system playback was detected by ScreenCaptureKit."
+        return (
+            "No system playback was detected. "
+            "Check that your meeting audio is playing and the output volume is up."
+        )
 
     @property
     def format_summary(self) -> str | None:
@@ -123,18 +128,45 @@ class ScreenCaptureKitSource:
         self._framework.prepare()
 
     def start(self, on_block: BlockHandler, on_error: ErrorHandler) -> None:
+        with self._state_lock:
+            if self._running:
+                raise RuntimeError("ScreenCaptureKit source is already running")
+            self._running = True
+
+        def failed(error: Exception) -> None:
+            if not self._claim_running():
+                return
+            try:
+                self._framework.stop()
+            except Exception as cleanup_error:
+                on_error(RuntimeError(f"{error}; cleanup failed: {cleanup_error}"))
+                return
+            on_error(error)
+
         def deliver(samples: np.ndarray) -> None:
             try:
                 block = np.asarray(samples, dtype=np.float32).reshape(-1).copy()
             except Exception as exc:
-                on_error(exc)
+                failed(exc)
                 return
             on_block(block)
 
-        self._framework.start(deliver, on_error)
+        try:
+            self._framework.start(deliver, failed)
+        except Exception:
+            self._claim_running()
+            self._framework.stop()
+            raise
 
     def stop(self) -> None:
-        self._framework.stop()
+        if self._claim_running():
+            self._framework.stop()
+
+    def _claim_running(self) -> bool:
+        with self._state_lock:
+            was_running = self._running
+            self._running = False
+            return was_running
 
 
 class _StreamDelegate(
@@ -187,6 +219,7 @@ class _PyObjCScreenCaptureKit:
         self._stream: Any = None
         self._delegate: _StreamDelegate | None = None
         self._sample_queue: Any = None
+        self._state_lock = threading.Lock()
 
     def prepare(self) -> None:
         if not Quartz.CGPreflightScreenCaptureAccess():
@@ -244,13 +277,18 @@ class _PyObjCScreenCaptureKit:
             self.prepare()
 
         delegate = _StreamDelegate.alloc().init()
-        delegate.configure(on_samples, on_error, self._copy_samples)
         sample_queue = dispatch.dispatch_queue_create(
             b"com.helpmeeting.screencapturekit.audio", None
         )
         stream = SCK.SCStream.alloc().initWithFilter_configuration_delegate_(
             self._filter, self._configuration, delegate
         )
+
+        def stream_failed(error: Exception) -> None:
+            self._clear_stream(stream)
+            on_error(error)
+
+        delegate.configure(on_samples, stream_failed, self._copy_samples)
         added, error = stream.addStreamOutput_type_sampleHandlerQueue_error_(
             delegate, SCK.SCStreamOutputTypeAudio, sample_queue, None
         )
@@ -259,9 +297,10 @@ class _PyObjCScreenCaptureKit:
                 f"ScreenCaptureKit could not add its audio output: {_error_text(error)}"
             )
 
-        self._delegate = delegate
-        self._sample_queue = sample_queue
-        self._stream = stream
+        with self._state_lock:
+            self._delegate = delegate
+            self._sample_queue = sample_queue
+            self._stream = stream
         completed = threading.Event()
         result: dict[str, Any] = {}
 
@@ -271,20 +310,23 @@ class _PyObjCScreenCaptureKit:
 
         stream.startCaptureWithCompletionHandler_(started)
         if not completed.wait(_ASYNC_TIMEOUT):
-            self._clear_stream()
+            self._clear_stream(stream)
             raise RuntimeError("ScreenCaptureKit timed out while starting capture")
         if result["error"] is not None:
-            self._clear_stream()
+            self._clear_stream(stream)
             raise RuntimeError(
                 f"ScreenCaptureKit could not start capture: {_error_text(result['error'])}"
             )
 
     def stop(self) -> None:
-        stream = self._stream
-        if stream is None:
-            return
-        if self._delegate is not None:
-            self._delegate.mark_stopping()
+        with self._state_lock:
+            stream = self._stream
+            delegate = self._delegate
+            if stream is None:
+                return
+            if delegate is not None:
+                delegate.mark_stopping()
+            self._clear_stream_locked()
 
         completed = threading.Event()
         result: dict[str, Any] = {}
@@ -293,16 +335,16 @@ class _PyObjCScreenCaptureKit:
             result["error"] = error
             completed.set()
 
-        try:
-            stream.stopCaptureWithCompletionHandler_(stopped)
-            if not completed.wait(_ASYNC_TIMEOUT):
-                raise RuntimeError("ScreenCaptureKit timed out while stopping capture")
-            if result["error"] is not None:
-                raise RuntimeError(
-                    f"ScreenCaptureKit could not stop capture: {_error_text(result['error'])}"
-                )
-        finally:
-            self._clear_stream()
+        stream.stopCaptureWithCompletionHandler_(stopped)
+        if not completed.wait(_ASYNC_TIMEOUT):
+            stream.stopCaptureWithCompletionHandler_(
+                lambda error: None  # best-effort: already orphaned
+            )
+            return
+        if result["error"] is not None:
+            raise RuntimeError(
+                f"ScreenCaptureKit could not stop capture: {_error_text(result['error'])}"
+            )
 
     def _copy_samples(self, sample_buffer: Any) -> np.ndarray:
         if not CM.CMSampleBufferDataIsReady(sample_buffer):
@@ -331,10 +373,24 @@ class _PyObjCScreenCaptureKit:
             )
         return samples
 
-    def _clear_stream(self) -> None:
+    def _clear_stream(self, expected_stream: Any = None) -> None:
+        with self._state_lock:
+            if expected_stream is not None and self._stream is not expected_stream:
+                return
+            self._clear_stream_locked()
+
+    def _clear_stream_locked(self) -> None:
+        stream = self._stream
         self._stream = None
         self._delegate = None
         self._sample_queue = None
+        self._content = None
+        self._filter = None
+        self._configuration = None
+        if stream is not None:
+            stream.removeStreamOutput_type_error_(
+                stream, SCK.SCStreamOutputTypeAudio, None
+            )
 
 
 def _fourcc(value: int) -> str:

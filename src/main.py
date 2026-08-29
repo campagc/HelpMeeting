@@ -210,6 +210,10 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
     from src.transcript import Transcript
     from src.turn import Turn
 
+    source = default_system_playback_source()
+    source.prepare()
+    output_fn(f"Capturing audio from {source.description}")
+
     transcript = Transcript()
     storage = Storage()
     storage.start_meeting(settings["label"], [settings["spoken_language"], settings["explanation_language"]])
@@ -222,9 +226,6 @@ def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=prin
     )
 
     audio_log = storage.meeting_dir / "audio_debug.log" if storage.meeting_dir else None
-    source = default_system_playback_source()
-    source.prepare()
-    output_fn(f"Capturing audio from {source.description}")
     if audio_log is not None:
         output_fn(f"Audio diagnostics: {audio_log}")
     audio_thread = AudioThread(

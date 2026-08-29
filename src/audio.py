@@ -121,7 +121,7 @@ class AudioThread:
         try:
             self._source.stop()
         finally:
-            self._thread.join()
+            self._thread.join(timeout=5.0)
 
     # ------------------------------------------------------------------
     # Restart-on-exception outer loop
@@ -143,7 +143,9 @@ class AudioThread:
                     break
                 self._log("capture loop crashed:\n" + traceback.format_exc())
                 print(f"[AudioThread] error — restarting in 2 s: {exc}")
-                time.sleep(2)
+                for _ in range(20):
+                    if self._stop_event.wait(0.1):
+                        break
         self._log("thread exit")
 
     # ------------------------------------------------------------------
@@ -170,11 +172,14 @@ class AudioThread:
 
         # Flush any remaining audio that did not fill a full chunk.
         if remaining:
-            audio_chunk = np.concatenate(remaining)
-            text = transcriber.transcribe(audio_chunk)
-            if text:
-                self._transcript.append(text)
-                self._storage.append_transcript(text)
+            try:
+                audio_chunk = np.concatenate(remaining)
+                text = transcriber.transcribe(audio_chunk)
+                if text:
+                    self._transcript.append(text)
+                    self._storage.append_transcript(text)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"final flush failed: {exc}")
 
     # ------------------------------------------------------------------
     # Core chunk-accumulation loop (testable seam)
@@ -197,7 +202,7 @@ class AudioThread:
         warned_silent = False
         chunk_count = 0
 
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() or not audio_queue.empty():
             try:
                 block = audio_queue.get(timeout=0.5)
             except queue.Empty:

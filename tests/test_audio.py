@@ -22,6 +22,7 @@ from src.audio import (
 )
 from src.screencapturekit_playback import ScreenCaptureKitSource
 from src.storage import Storage
+from src.system_playback import BlackHoleSource, default_system_playback_source
 from src.transcript import Transcript
 
 
@@ -158,6 +159,52 @@ def _feed_and_run(thread: AudioThread, transcriber, blocks, *, join_timeout: flo
 # ---------------------------------------------------------------------------
 
 class TestSystemPlaybackSource:
+    def test_explicit_blackhole_source_grows_transcript_through_shared_transcription(
+        self, tmp_path, monkeypatch
+    ):
+        devices = [
+            {"name": "MacBook Air Microphone", "max_input_channels": 1},
+            {"name": "BlackHole 2ch", "max_input_channels": 2},
+        ]
+        started = threading.Event()
+        stream_callbacks = {}
+
+        class FakeInputStream:
+            def __init__(self, **kwargs) -> None:
+                stream_callbacks.update(kwargs)
+
+            def start(self) -> None:
+                started.set()
+
+            def stop(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setenv("HELPMEETING_AUDIO_SOURCE", "blackhole")
+        monkeypatch.setattr("src.system_playback.sd.query_devices", lambda: devices)
+        monkeypatch.setattr("src.system_playback.sd.InputStream", FakeInputStream)
+        source = default_system_playback_source()
+        assert isinstance(source, BlackHoleSource)
+        source.prepare()
+        transcriber = FakeTranscriber("captured speech")
+        thread, transcript, storage = _make_thread(tmp_path, transcriber, source=source)
+
+        thread.start()
+        assert started.wait(timeout=1.0)
+        stream_callbacks["callback"](
+            np.full((_SAMPLE_RATE, 1), 0.1, dtype="float32"), _SAMPLE_RATE, None, None
+        )
+        deadline = time.monotonic() + 1.0
+        while not transcriber.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        thread.stop()
+
+        assert transcript.take_delta() == "captured speech"
+        transcript_path = storage.meeting_dir / "transcript.txt"
+        assert transcript_path.read_text(encoding="utf-8") == "captured speech"
+
     def test_screencapturekit_source_grows_transcript_through_shared_transcription(self, tmp_path):
         native_capture = FakeScreenCaptureKitFramework()
         source = ScreenCaptureKitSource(framework=native_capture)
@@ -205,7 +252,7 @@ class TestSystemPlaybackSource:
         source = FakeSystemPlaybackSource()
         thread, _, _ = _make_thread(tmp_path, FakeTranscriber(), source=source)
 
-        with patch("src.audio.time.sleep", return_value=None):
+        with patch.object(thread._stop_event, "wait", return_value=True):
             thread.start()
             assert source.started.wait(timeout=1.0)
             source.fail(RuntimeError("device disconnected"))

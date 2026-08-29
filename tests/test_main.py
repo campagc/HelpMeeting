@@ -1,7 +1,11 @@
 import json
+from types import SimpleNamespace
+
+import pytest
 
 from src.assistant import AssistantUnavailable
-from src.main import main, prompt_settings, MeetingSession
+from src.main import MeetingSession, _build_session, main, prompt_settings
+from src.screencapturekit_playback import ScreenCapturePermissionError
 from src.storage import Storage
 from src.turn import Turn, TurnResult
 from src.transcript import Transcript
@@ -515,6 +519,31 @@ class TestHudLifecycle:
 
 
 class TestMain:
+    def test_unknown_audio_source_fails_before_meeting_starts(self, monkeypatch):
+        started_meetings = []
+        monkeypatch.setenv("HELPMEETING_AUDIO_SOURCE", "automatic")
+        monkeypatch.setattr(
+            Storage,
+            "start_meeting",
+            lambda self, label, languages: started_meetings.append((label, languages)),
+        )
+        config = SimpleNamespace(
+            api_key="test-key",
+            gemini_model_name="test-model",
+            system_prompt="test prompt",
+        )
+        settings = {
+            "label": "test-meeting",
+            "spoken_language": "en",
+            "explanation_language": "en",
+            "monitor_index": 1,
+        }
+
+        with pytest.raises(ValueError, match="HELPMEETING_AUDIO_SOURCE"):
+            _build_session(config, settings)
+
+        assert started_meetings == []
+
     def test_main_prints_ready_when_config_loads(self, tmp_path, monkeypatch, capsys):
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".env").write_text("GEMINI_API_KEY=test-key\n")

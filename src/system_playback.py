@@ -1,5 +1,6 @@
 """System-playback source interface and BlackHole adapter."""
 
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
@@ -53,6 +54,15 @@ class SystemPlaybackSource(Protocol):
 
 
 def default_system_playback_source() -> SystemPlaybackSource:
+    backend = os.getenv("HELPMEETING_AUDIO_SOURCE", "screencapturekit")
+    if backend == "blackhole":
+        return BlackHoleSource()
+    if backend != "screencapturekit":
+        raise ValueError(
+            f"Unsupported HELPMEETING_AUDIO_SOURCE={backend!r}. "
+            "Supported values: blackhole, screencapturekit"
+        )
+
     from src.screencapturekit_playback import ScreenCaptureKitSource
 
     return ScreenCaptureKitSource()

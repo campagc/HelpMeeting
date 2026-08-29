@@ -73,7 +73,7 @@ def run_diagnostic(
         arrival_times.append(clock_fn())
 
     output_before = output_device_fn()
-    output_fn(f"Source: {source.description}")
+    output_fn(f"Selected source: {source.description}")
     output_fn(f"Requested duration: {seconds}s")
     output_fn(f"Active output before capture: {output_before}")
     output_fn(
@@ -140,7 +140,7 @@ def run_diagnostic(
         output_fn(f"Transcript: {text}")
 
     if rms < 1e-4:
-        output_fn("FAILED: ScreenCaptureKit captured silence. Play speech and run again.")
+        output_fn(f"FAILED: {source.silence_warning}")
         return 1
     if not text:
         output_fn("FAILED: the captured signal did not produce a Whisper transcript.")

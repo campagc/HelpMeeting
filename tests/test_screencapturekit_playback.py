@@ -1,13 +1,29 @@
 from collections.abc import Callable
 
 import numpy as np
+import pytest
 
 from src.screencapturekit_playback import ScreenCaptureKitSource
-from src.system_playback import default_system_playback_source
+from src.system_playback import BlackHoleSource, default_system_playback_source
 
 
-def test_default_system_playback_source_uses_screencapturekit():
+def test_default_system_playback_source_uses_screencapturekit(monkeypatch):
+    monkeypatch.delenv("HELPMEETING_AUDIO_SOURCE", raising=False)
+
     assert isinstance(default_system_playback_source(), ScreenCaptureKitSource)
+
+
+def test_explicit_blackhole_system_playback_source_bypasses_screencapturekit(monkeypatch):
+    monkeypatch.setenv("HELPMEETING_AUDIO_SOURCE", "blackhole")
+
+    assert isinstance(default_system_playback_source(), BlackHoleSource)
+
+
+def test_unknown_system_playback_source_lists_supported_values(monkeypatch):
+    monkeypatch.setenv("HELPMEETING_AUDIO_SOURCE", "automatic")
+
+    with pytest.raises(ValueError, match="blackhole.*screencapturekit"):
+        default_system_playback_source()
 
 
 class FakeScreenCaptureKit:
@@ -17,6 +33,8 @@ class FakeScreenCaptureKit:
         self.prepared = False
         self.started = False
         self.stopped = False
+        self.stop_count = 0
+        self.events: list[str] = []
         self._on_samples: Callable[[np.ndarray], None] | None = None
         self._on_error: Callable[[Exception], None] | None = None
 
@@ -25,6 +43,7 @@ class FakeScreenCaptureKit:
 
     def start(self, on_samples, on_error) -> None:
         self.started = True
+        self.events.append("started")
         self._on_samples = on_samples
         self._on_error = on_error
 
@@ -38,6 +57,8 @@ class FakeScreenCaptureKit:
 
     def stop(self) -> None:
         self.stopped = True
+        self.stop_count += 1
+        self.events.append("stopped")
 
 
 def test_source_delivers_copied_16khz_mono_float32_blocks():
@@ -70,13 +91,25 @@ def test_source_stops_framework_cleanly():
     assert framework.stopped is True
 
 
-def test_source_propagates_framework_failure():
+def test_source_cleans_up_before_propagating_framework_failure():
     framework = FakeScreenCaptureKit()
     source = ScreenCaptureKitSource(framework=framework)
-    errors: list[Exception] = []
+    events: list[str] = []
     failure = RuntimeError("stream stopped")
 
-    source.start(lambda _: None, errors.append)
+    source.start(lambda _: None, lambda error: events.append(str(error)))
     framework.fail(failure)
 
-    assert errors == [failure]
+    assert framework.events == ["started", "stopped"]
+    assert events == ["stream stopped"]
+
+
+def test_source_stop_is_idempotent():
+    framework = FakeScreenCaptureKit()
+    source = ScreenCaptureKitSource(framework=framework)
+
+    source.start(lambda _: None, lambda _: None)
+    source.stop()
+    source.stop()
+
+    assert framework.stop_count == 1
