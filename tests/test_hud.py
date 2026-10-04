@@ -15,12 +15,7 @@ import pytest
 
 from src.feedback import Badge, BadgeKind
 from src.hud import NullHud, HudPanel, badge_glyph
-
-
-@pytest.fixture(autouse=True)
-def _patch_mss_for_hud(monkeypatch):
-    """Keep HudPanel tests away from the real display list."""
-    monkeypatch.setattr("src.hud.mss", FakeMSSModule)
+from src.display import Displays
 
 
 class TestNullHudFallback:
@@ -129,7 +124,6 @@ class _FakePanelAlloc:
 
 class FakeNSPanel:
     instances: list["FakeNSPanel"] = []
-    _next_window_number = 1000
 
     def __init__(self):
         self.level = None
@@ -145,8 +139,6 @@ class FakeNSPanel:
         self.content_view = None
         self.is_visible = False
         self.is_closed = False
-        self.window_number = FakeNSPanel._next_window_number
-        FakeNSPanel._next_window_number += 1
 
     @classmethod
     def alloc(cls):
@@ -194,10 +186,6 @@ class FakeNSPanel:
     def close(self):
         self.is_closed = True
         self.is_visible = False
-
-    def windowNumber(self):
-        return self.window_number
-
 
 class FakeLabel:
     def __init__(self, rect):
@@ -327,28 +315,27 @@ class FakeNSDate:
         return None
 
 
-class FakeMSS:
+class FakeDisplayBackend:
     def __init__(self, monitors):
         self.monitors = monitors
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *_):
         return False
 
 
-class FakeMSSModule:
-    """Replacement for the mss module so tests never touch real displays."""
-
-    @staticmethod
-    def MSS():
-        return FakeMSS(
-            [
-                {},
-                {"left": 0, "top": 0, "width": 1440, "height": 900},
-            ]
-        )
+def make_hud(display_index=1):
+    monitors = [
+        {"left": 0, "top": 0, "width": 2880, "height": 900},
+        {"left": 0, "top": 0, "width": 1440, "height": 900},
+        {"left": 1440, "top": 0, "width": 1440, "height": 900},
+    ]
+    return HudPanel(
+        displays=Displays(backend_factory=lambda: FakeDisplayBackend(monitors)),
+        display_index=display_index,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +355,7 @@ class TestHudPanel:
         monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         hud.turn_started()
 
         assert len(FakeNSPanel.instances) >= 1
@@ -377,7 +364,8 @@ class TestHudPanel:
         assert panel.is_visible is True
         assert panel.content_view is not None
         assert panel.content_view.string == "\N{LARGE ORANGE CIRCLE}"
-        assert hud.window_id == panel.window_number
+        assert panel.rect.origin.x == 1396.0
+        assert panel.rect.origin.y == 12.0
 
         assert panel.style_mask == (
             AppKit.NSBorderlessWindowMask | AppKit.NSNonactivatingPanelMask
@@ -414,7 +402,7 @@ class TestHudPanel:
         monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         hud.turn_started()
         panel = FakeNSPanel.instances[-1]
 
@@ -427,7 +415,7 @@ class TestHudPanel:
         monkeypatch.setattr("src.hud.NSPanel", FakeNSPanel)
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         hud.turn_started()
         panel = FakeNSPanel.instances[-1]
 
@@ -441,7 +429,7 @@ class TestHudPanel:
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
         monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         hud.turn_started()
         panel = FakeNSPanel.instances[-1]
 
@@ -465,7 +453,7 @@ class TestHudPanel:
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
         monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
 
         # Two turns are started; the first finishes while the second is still queued.
         hud.turn_started()
@@ -498,7 +486,7 @@ class TestHudPanel:
         monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
         monkeypatch.setattr("src.hud.NSDate", FakeNSDate)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         hud.turn_started()
         panel = FakeNSPanel.instances[-1]
         assert panel.is_closed is False
@@ -514,7 +502,7 @@ class TestHudPanel:
         monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
         monkeypatch.setattr("src.hud.NSDate", FakeNSDate)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         threading.Timer(0.05, hud.stop).start()
         hud.run()
 
@@ -529,7 +517,7 @@ class TestHudPanel:
         assert timer.invalidated is True
 
     def test_run_on_non_main_thread_uses_fallback(self, monkeypatch):
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         started = threading.Event()
 
         def run_in_thread():
@@ -555,7 +543,7 @@ class TestHudPanel:
 
         monkeypatch.setattr("src.hud.NSApplication", ExplodingNSApplication)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         threading.Timer(0.05, hud.stop).start()
         hud.run()
 
@@ -567,7 +555,7 @@ class TestHudPanel:
         monkeypatch.setattr("src.hud.NSTextField", FakeNSTextField)
         monkeypatch.setattr("src.hud.NSTimer", FakeNSTimer)
 
-        hud = HudPanel(monitor_index=1)
+        hud = make_hud()
         # turn_started/turn_finished may be called before run() starts.
         hud.turn_started()
         hud.turn_finished(True)

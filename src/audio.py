@@ -1,32 +1,53 @@
-"""audio module: system-audio capture and local transcription thread.
+"""System-audio intake and local transcription.
 
 Public interface
 ----------------
-thread = AudioThread(
-    transcript=transcript,
-    storage=storage,
+transcriber = WhisperTranscriber(model_size="small", language="en")
+intake = TranscriptIntake(
     source=system_playback_source,
+    transcriber=transcriber,
+    transcript=transcript,
+    archive=archive,
     chunk_seconds=10,
-    language="en",
-    model_size="small",
 )
-thread.start()   # non-blocking; returns immediately
-thread.stop()    # signals the thread to finish and joins it
+intake.start()
+intake.stop()
 """
 
 import queue
 import threading
 import time
+import traceback
+from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 from faster_whisper import WhisperModel
 
+from src.storage import Storage
 from src.system_playback import SAMPLE_RATE, SystemPlaybackSource
+from src.transcript import Transcript
 
 _SAMPLE_RATE = SAMPLE_RATE
 _SILENCE_RMS = 1e-4         # below this a chunk is treated as silence
 _SILENCE_WARN_AFTER = 2     # warn after this many consecutive silent chunks
+
+
+def append_log(log_path: Path | None) -> Callable[[str], None]:
+    """Return a logger appending timestamped lines to log_path; a no-op when log_path is None."""
+    if log_path is None:
+        return lambda _: None
+
+    def log(message: str) -> None:
+        try:
+            stamp = time.strftime("%H:%M:%S")
+            with log_path.open("a", encoding="utf-8") as file:
+                file.write(f"[{stamp}] {message}\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+    return log
 
 
 class Transcriber(Protocol):
@@ -38,21 +59,29 @@ class Transcriber(Protocol):
 
 
 class WhisperTranscriber:
-    """Concrete Transcriber backed by faster-whisper.WhisperModel.
+    """Concrete Transcriber backed by faster-whisper.WhisperModel."""
 
-    The model is loaded eagerly in __init__ so failures are reported at
-    startup (matching the original _capture_loop behaviour).
-    """
-
-    def __init__(self, model_size: str, language: str, log_fn=None) -> None:
+    def __init__(
+        self,
+        model_size: str,
+        language: str,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> None:
+        self._model_size = model_size
         self._language = language
-        _log = log_fn or (lambda _: None)
-        _log("loading Whisper model…")
-        self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        _log("Whisper model loaded")
+        self._log = log_fn if log_fn is not None else lambda _: None
+        self._model = None
 
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe a 1-D float32 numpy array; return combined text or empty string."""
+        if self._model is None:
+            self._log("loading Whisper model…")
+            self._model = WhisperModel(
+                self._model_size,
+                device="cpu",
+                compute_type="int8",
+            )
+            self._log("Whisper model loaded")
         segments, _info = self._model.transcribe(
             audio,
             language=self._language,
@@ -62,139 +91,74 @@ class WhisperTranscriber:
         return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-class AudioThread:
-    """Background thread: captures system audio, transcribes in ~chunk_seconds windows,
-    appends text to the transcript object and persists it via storage."""
+class TranscriptIntake:
+    """Capture system playback, append Transcript text, and persist it to Storage."""
 
     def __init__(
         self,
         *,
-        transcript,
-        storage,
         source: SystemPlaybackSource,
+        transcriber: Transcriber,
+        transcript: Transcript,
+        archive: Storage,
         chunk_seconds: int = 10,
-        language: str = "en",
-        model_size: str = "small",
-        log_path=None,
-        transcriber: Transcriber | None = None,
-    ):
-        self._transcript = transcript
-        self._storage = storage
+        log_path: Path | None = None,
+        restart_delay_seconds: float = 2.0,
+        warn: Callable[[str], None] = print,
+    ) -> None:
         self._source = source
-        self._chunk_seconds = chunk_seconds
-        self._language = language
-        self._model_size = model_size
-        self._log_path = log_path
         self._transcriber = transcriber
-
+        self._transcript = transcript
+        self._archive = archive
+        self._chunk_seconds = chunk_seconds
+        self._log = append_log(log_path)
+        self._restart_delay_seconds = restart_delay_seconds
+        self._warn = warn
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
-            target=self._run_with_restart, daemon=True, name="AudioThread"
+            target=self._run,
+            daemon=True,
+            name="TranscriptIntake",
         )
 
-    # ------------------------------------------------------------------
-    # Debug logging
-    # ------------------------------------------------------------------
-
-    def _log(self, message: str) -> None:
-        """Append a timestamped diagnostic line to the debug log (if configured)."""
-        if self._log_path is None:
-            return
-        try:
-            stamp = time.strftime("%H:%M:%S")
-            with open(self._log_path, "a", encoding="utf-8") as f:
-                f.write(f"[{stamp}] {message}\n")
-        except Exception:  # noqa: BLE001
-            pass
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
-
     def start(self) -> None:
-        """Start the transcription thread (non-blocking)."""
+        """Start the intake thread without blocking."""
         self._thread.start()
 
     def stop(self) -> None:
-        """Signal the thread to stop and block until it exits."""
+        """Stop capture, drain queued blocks, and join the intake thread."""
         self._stop_event.set()
         try:
             self._source.stop()
         finally:
             self._thread.join(timeout=5.0)
 
-    # ------------------------------------------------------------------
-    # Restart-on-exception outer loop
-    # ------------------------------------------------------------------
-
-    def _run_with_restart(self) -> None:
-        """Outer loop: if the inner capture loop raises, restart after a short delay."""
-        import traceback
-
+    def _run(self) -> None:
         self._log(
-            f"thread start | source={self._source.description} model={self._model_size} "
-            f"chunk_seconds={self._chunk_seconds} language={self._language}"
+            f"thread start | source={self._source.description} "
+            f"chunk_seconds={self._chunk_seconds}"
         )
         while not self._stop_event.is_set():
+            audio_queue: queue.Queue[np.ndarray | Exception] = queue.Queue()
             try:
-                self._capture_loop()
+                try:
+                    self._source.start(audio_queue.put, audio_queue.put)
+                    remaining = self._consume(audio_queue)
+                finally:
+                    self._source.stop()
+                self._flush(remaining)
             except Exception as exc:  # noqa: BLE001
                 if self._stop_event.is_set():
                     break
                 self._log("capture loop crashed:\n" + traceback.format_exc())
-                print(f"[AudioThread] error — restarting in 2 s: {exc}")
-                for _ in range(20):
-                    if self._stop_event.wait(0.1):
-                        break
+                self._warn(
+                    f"[TranscriptIntake] error — restarting in "
+                    f"{self._restart_delay_seconds} s: {exc}"
+                )
+                self._stop_event.wait(self._restart_delay_seconds)
         self._log("thread exit")
 
-    # ------------------------------------------------------------------
-    # Inner capture + transcription loop
-    # ------------------------------------------------------------------
-
-    def _capture_loop(self) -> None:
-        """Consume source blocks and transcribe each complete ~chunk_seconds window
-        until _stop_event is set."""
-        transcriber = self._transcriber
-        if transcriber is None:
-            transcriber = WhisperTranscriber(
-                model_size=self._model_size,
-                language=self._language,
-                log_fn=self._log,
-            )
-
-        audio_queue: queue.Queue[np.ndarray | Exception] = queue.Queue()
-        self._source.start(audio_queue.put, audio_queue.put)
-        try:
-            remaining = self._run_chunk_loop(audio_queue, transcriber)
-        finally:
-            self._source.stop()
-
-        # Flush any remaining audio that did not fill a full chunk.
-        if remaining:
-            try:
-                audio_chunk = np.concatenate(remaining)
-                text = transcriber.transcribe(audio_chunk)
-                if text:
-                    self._transcript.append(text)
-                    self._storage.append_transcript(text)
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"final flush failed: {exc}")
-
-    # ------------------------------------------------------------------
-    # Core chunk-accumulation loop (testable seam)
-    # ------------------------------------------------------------------
-
-    def _run_chunk_loop(
-        self,
-        audio_queue: "queue.Queue[np.ndarray | Exception]",
-        transcriber: Transcriber,
-    ) -> "list[np.ndarray]":
-        """Accumulate audio blocks, detect silence, and transcribe complete chunks.
-
-        Returns the leftover accumulator (blocks that did not fill a complete chunk)
-        so the caller can flush them after the stream closes.
-        """
+    def _consume(self, audio_queue: queue.Queue[np.ndarray | Exception]) -> list[np.ndarray]:
         frames_per_chunk = _SAMPLE_RATE * self._chunk_seconds
         accumulator: list[np.ndarray] = []
         accumulated_frames = 0
@@ -212,35 +176,47 @@ class AudioThread:
 
             accumulator.append(block)
             accumulated_frames += len(block)
+            if accumulated_frames < frames_per_chunk:
+                continue
 
-            if accumulated_frames >= frames_per_chunk:
-                audio_chunk = np.concatenate(accumulator)
-                accumulator = []
-                accumulated_frames = 0
-                chunk_count += 1
+            audio_chunk = np.concatenate(accumulator)
+            accumulator = []
+            accumulated_frames = 0
+            chunk_count += 1
 
-                rms = float(np.sqrt(np.mean(audio_chunk ** 2)))
-                peak = float(np.max(np.abs(audio_chunk)))
-                self._log(
-                    f"chunk #{chunk_count}: frames={len(audio_chunk)} "
-                    f"rms={rms:.6f} peak={peak:.6f}"
-                )
+            rms = float(np.sqrt(np.mean(audio_chunk ** 2)))
+            peak = float(np.max(np.abs(audio_chunk)))
+            self._log(
+                f"chunk #{chunk_count}: frames={len(audio_chunk)} "
+                f"rms={rms:.6f} peak={peak:.6f}"
+            )
 
-                # Warn once if system playback is not reaching transcription.
-                if rms < _SILENCE_RMS:
-                    silent_chunks += 1
-                    if silent_chunks >= _SILENCE_WARN_AFTER and not warned_silent:
-                        warned_silent = True
-                        self._log("SILENCE detected — audio is not reaching the device")
-                        print(f"[AudioThread] {self._source.silence_warning}")
-                    continue
-                silent_chunks = 0
-                warned_silent = False
+            if rms < _SILENCE_RMS:
+                silent_chunks += 1
+                if silent_chunks >= _SILENCE_WARN_AFTER and not warned_silent:
+                    warned_silent = True
+                    self._log("SILENCE detected — audio is not reaching the device")
+                    self._warn(f"[TranscriptIntake] {self._source.silence_warning}")
+                continue
 
-                text = transcriber.transcribe(audio_chunk)
-                self._log(f"chunk #{chunk_count} transcribed: {len(text)} chars: {text[:80]!r}")
-                if text:
-                    self._transcript.append(text)
-                    self._storage.append_transcript(text)
+            silent_chunks = 0
+            warned_silent = False
+            text = self._transcriber.transcribe(audio_chunk)
+            self._log(f"chunk #{chunk_count} transcribed: {len(text)} chars: {text[:80]!r}")
+            if text:
+                self._transcript.append(text)
+                self._archive.append_transcript(text)
 
         return accumulator
+
+    def _flush(self, remaining: list[np.ndarray]) -> None:
+        if not remaining:
+            return
+        try:
+            audio_chunk = np.concatenate(remaining)
+            text = self._transcriber.transcribe(audio_chunk)
+            if text:
+                self._transcript.append(text)
+                self._archive.append_transcript(text)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"final flush failed: {exc}")

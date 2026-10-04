@@ -32,20 +32,6 @@ class DiagnosticSource(SystemPlaybackSource, Protocol):
         ...
 
 
-class _LazyWhisperTranscriber:
-    def __init__(self) -> None:
-        self._transcriber: WhisperTranscriber | None = None
-
-    def transcribe(self, audio: np.ndarray) -> str:
-        if self._transcriber is None:
-            self._transcriber = WhisperTranscriber(
-                model_size=WHISPER_MODEL_SIZE,
-                language="en",
-                log_fn=print,
-            )
-        return self._transcriber.transcribe(audio)
-
-
 def active_output_device() -> str:
     try:
         return str(sd.query_devices(kind="output")["name"])
@@ -171,7 +157,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     return run_diagnostic(
         source=ScreenCaptureKitSource(),
-        transcriber=_LazyWhisperTranscriber(),
+        transcriber=WhisperTranscriber(
+            model_size=WHISPER_MODEL_SIZE,
+            language="en",
+            log_fn=print,
+        ),
         seconds=seconds,
     )
 

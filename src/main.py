@@ -1,263 +1,61 @@
-"""main orchestration: startup prompts, threads, question loop, finalize.
-
-Public interface
-----------------
-settings = prompt_settings()
-session = MeetingSession(settings, config, ...)
-session.start()
-session.run_input_loop()   # runs until Ctrl+C or EOF
-session.stop()
-"""
+"""Command-line entry: collect Meeting settings and run the Meeting."""
 
 import os
 import sys
-import threading
-import queue
+from collections.abc import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import load, MissingApiKeyError, format_hotkeys
-from src.hud import HudPanel, NullHud
-from src.screencapturekit_playback import ScreenCapturePermissionError
+from src.config import MissingApiKeyError, load
+from src.display import Display, Displays
+from src.meeting import Meeting, MeetingSettings, MeetingStartupError
 
 
-def _list_monitors():
-    import mss
-
-    with mss.MSS() as sct:
-        return sct.monitors
-
-
-def _choose_monitor(monitors, input_fn, output_fn):
-    """Return the mss monitor index to capture (1 = first physical display)."""
-    if len(monitors) <= 2:
+def _choose_display(
+    displays: list[Display],
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> int:
+    if len(displays) <= 1:
         return 1
-    output_fn(f"Found {len(monitors) - 1} displays:")
-    for i in range(1, len(monitors)):
-        m = monitors[i]
-        output_fn(f"  {i}: {m['width']}x{m['height']} at ({m['left']}, {m['top']})")
+    output_fn(f"Found {len(displays)} displays:")
+    for display in displays:
+        output_fn(
+            f"  {display.index}: {display.width}x{display.height} "
+            f"at ({display.left}, {display.top})"
+        )
     choice = input_fn("Choose display for screenshots [1]: ").strip() or "1"
     try:
-        idx = int(choice)
-        if 1 <= idx < len(monitors):
-            return idx
+        index = int(choice)
+        if index in {display.index for display in displays}:
+            return index
     except ValueError:
         pass
     return 1
 
 
-def prompt_settings(input_fn=input, output_fn=print, list_monitors_fn=_list_monitors):
-    """Prompt the user for the startup settings and return them as a dict."""
+def prompt_settings(
+    input_fn=input,
+    output_fn=print,
+    displays: Displays | None = None,
+):
     label = input_fn("Meeting label: ").strip()
     if not label:
         label = "meeting"
 
     spoken_language = input_fn("Spoken language [en]: ").strip() or "en"
-    explanation_default = spoken_language
     explanation_language = (
-        input_fn(f"Explanation language [{explanation_default}]: ").strip() or explanation_default
+        input_fn(f"Explanation language [{spoken_language}]: ").strip()
+        or spoken_language
     )
+    display_index = _choose_display((displays or Displays()).list(), input_fn, output_fn)
 
-    monitor_index = _choose_monitor(list_monitors_fn(), input_fn, output_fn)
-
-    return {
-        "label": label,
-        "spoken_language": spoken_language,
-        "explanation_language": explanation_language,
-        "monitor_index": monitor_index,
-    }
-
-
-class MeetingSession:
-    """Wires the Turn, audio, capture, and storage modules into the live loop.
-
-    The capture object must be pre-configured with its own callback pointing at
-    ``on_hotkey``.  This class owns the threads: audio transcription, capture
-    listener, and the assistant worker that processes Explain and Question turns.
-    Each queued Turn is resolved through the Turn module.
-    """
-
-    def __init__(
-        self,
-        *,
-        turn,
-        storage,
-        audio_thread,
-        capture,
-        input_fn=input,
-        output_fn=print,
-        hud=None,
-    ):
-        self._turn = turn
-        self._storage = storage
-        self._audio_thread = audio_thread
-        self._capture = capture
-        self._input_fn = input_fn
-        self._output_fn = output_fn
-        self._hud = hud if hud is not None else NullHud()
-        self._print_lock = threading.Lock()
-        self._task_queue = queue.Queue()
-        self._worker_thread = threading.Thread(
-            target=self._worker_loop, daemon=True, name="AssistantWorker"
-        )
-        self._capture_thread: threading.Thread | None = None
-        self._shutdown = threading.Event()
-
-    def start(self) -> None:
-        """Start the audio, capture, and assistant-worker threads."""
-        self._audio_thread.start()
-        self._capture_thread = threading.Thread(
-            target=self._capture.start, daemon=True, name="CaptureListener"
-        )
-        self._capture_thread.start()
-        self._worker_thread.start()
-
-    def stop(self) -> None:
-        """Signal shutdown, finish queued turns, finalize storage, then stop threads.
-
-        Finalization happens before the (potentially slow) final audio flush so
-        that history.json is always written, even if the flush is interrupted by
-        an impatient second Ctrl+C.
-        """
-        self._shutdown.set()
-        self._quietly(self._capture.stop)
-
-        # Let any in-flight or queued turn finish and be recorded.
-        self._task_queue.put(None)
-        if self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=30.0)
-
-        # Critical: persist the machine-readable history before slow cleanup.
-        self._quietly(self._storage.finalize)
-
-        # Best-effort: flush the final transcript chunk; may be slow.
-        self._quietly(self._audio_thread.stop)
-
-        if self._capture_thread is not None:
-            self._quietly(lambda: self._capture_thread.join(timeout=1.0))
-
-    @staticmethod
-    def _quietly(func) -> None:
-        """Run a shutdown step, swallowing errors and stray KeyboardInterrupts so
-        one failing step never aborts the rest of finalization."""
-        try:
-            func()
-        except (Exception, KeyboardInterrupt):  # noqa: BLE001
-            pass
-
-    def run_input_loop(self) -> None:
-        """Read questions from the terminal until Ctrl+C or EOF."""
-        self._safe_print("Type a question and press Enter, or press Ctrl+C to stop.")
-        while not self._shutdown.is_set():
-            try:
-                question = self._input_fn("Question: ")
-            except (EOFError, KeyboardInterrupt):
-                self._shutdown.set()
-                self._hud.stop()
-                break
-            if self._shutdown.is_set():
-                break
-            if question.strip():
-                self.on_question(question)
-
-    def on_hotkey(self, png_bytes: bytes) -> None:
-        """Queue a slide-explanation turn."""
-        self._queue_turn("explain", png_bytes)
-
-    def on_question(self, text: str) -> None:
-        """Queue a question-and-answer turn."""
-        self._queue_turn("question", text)
-
-    def _queue_turn(self, kind: str, payload: bytes | str) -> None:
-        """Signal the HUD and queue a turn for the worker."""
-        self._hud.turn_started()
-        self._task_queue.put((kind, payload))
-
-    # ------------------------------------------------------------------
-    # Internal worker
-    # ------------------------------------------------------------------
-
-    def _worker_loop(self) -> None:
-        while True:
-            item = self._task_queue.get()
-            if item is None:
-                break
-            task_type, payload = item
-            if task_type == "explain":
-                result = self._turn.explain(payload)
-            else:
-                result = self._turn.ask(payload)
-            if result.ok:
-                heading = "[Explanation]" if task_type == "explain" else "[Answer]"
-                self._safe_print(f"\n{heading}\n{result.text}\n")
-            else:
-                self._safe_print(result.text)
-            self._hud.turn_finished(result.ok)
-
-    def _safe_print(self, message: str) -> None:
-        with self._print_lock:
-            self._output_fn(message)
-
-
-def _build_session(config, settings, *, hud=None, input_fn=input, output_fn=print):
-    """Wire the real dependencies into a MeetingSession."""
-    from google import genai
-
-    from src.audio import AudioThread
-    from src.assistant import Assistant
-    from src.capture import Capture
-    from src.storage import Storage
-    from src.system_playback import default_system_playback_source
-    from src.transcript import Transcript
-    from src.turn import Turn
-
-    source = default_system_playback_source()
-    source.prepare()
-    output_fn(f"Capturing audio from {source.description}")
-
-    transcript = Transcript()
-    storage = Storage()
-    storage.start_meeting(settings["label"], [settings["spoken_language"], settings["explanation_language"]])
-
-    client = genai.Client(api_key=config.api_key)
-    assistant = Assistant(
-        client=client,
-        model=config.gemini_model_name,
-        system_prompt=config.system_prompt,
+    return MeetingSettings(
+        label=label,
+        spoken_language=spoken_language,
+        explanation_language=explanation_language,
+        display_index=display_index,
     )
-
-    audio_log = storage.meeting_dir / "audio_debug.log" if storage.meeting_dir else None
-    if audio_log is not None:
-        output_fn(f"Audio diagnostics: {audio_log}")
-    audio_thread = AudioThread(
-        transcript=transcript,
-        storage=storage,
-        source=source,
-        chunk_seconds=config.audio_chunk_seconds,
-        language=settings["spoken_language"],
-        model_size=config.whisper_model_size,
-        log_path=audio_log,
-    )
-
-    turn = Turn(transcript=transcript, archive=storage, assistant=assistant)
-
-    session = MeetingSession(
-        turn=turn,
-        storage=storage,
-        audio_thread=audio_thread,
-        capture=None,  # set below after wiring the hotkey callback
-        input_fn=input_fn,
-        output_fn=output_fn,
-        hud=hud,
-    )
-    capture = Capture(
-        callback=session.on_hotkey,
-        monitor_index=settings["monitor_index"],
-        hotkeys=config.hotkeys,
-        hud=hud,
-    )
-    session._capture = capture
-    return session
 
 
 def main():
@@ -268,44 +66,12 @@ def main():
         return 1
 
     settings = prompt_settings()
-    hud = HudPanel(
-        monitor_index=settings["monitor_index"],
-        outcome_seconds=config.outcome_badge_seconds,
-    )
     try:
-        session = _build_session(config, settings, hud=hud)
-    except ScreenCapturePermissionError as exc:
+        meeting = Meeting.open(settings, config)
+    except MeetingStartupError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"HelpMeeting cannot start: {exc}", file=sys.stderr)
-        return 1
-
-    print(f"HelpMeeting ready: {settings['label']}")
-    print(f"  spoken: {settings['spoken_language']}, explanation: {settings['explanation_language']}")
-    print(f"  display: {settings['monitor_index']}")
-    print(f"Press {format_hotkeys(config.hotkeys)} to request an explanation, Ctrl+C to stop.")
-
-    # The question loop must yield the main thread to AppKit/NSApplication.
-    # Ctrl+C is handled by the HUD's interpreter-pump timer, not by input().
-    session.start()
-    input_thread = threading.Thread(
-        target=session.run_input_loop, daemon=True, name="QuestionInput"
-    )
-    input_thread.start()
-    try:
-        hud.run()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        hud.stop()
-        print("\nShutting down and saving the meeting…")
-        session.stop()
-        print("Done.")
-    return 0
+    return meeting.run()
 
 
 if __name__ == "__main__":

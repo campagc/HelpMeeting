@@ -8,13 +8,13 @@ hud.stop()                         # stops the run loop
 hud.turn_started()                 # show the Thinking badge
 hud.turn_finished(ok)              # show the Outcome badge, then dismiss it
 
-hud = HudPanel(monitor_index=1)    # real AppKit panel
+hud = HudPanel(displays=displays, display_index=1)    # real AppKit panel
 hud.run()                          # runs NSApplication on the main thread
 hud.stop()                         # tear down
 
 The panel is non-activating, floats above the menu bar, follows the user into
-full-screen Spaces, ignores mouse events, and is excluded from mss screenshots
-via NSWindowSharingNone.  If AppKit or the panel fails to initialise, the HUD
+full-screen Spaces, ignores mouse events, and is excluded from Slide captures
+via NSWindowSharingNone. If AppKit or the panel fails to initialise, the HUD
 degrades to the non-AppKit fallback so the meeting continues.
 
 The HUD owns the panel and the dismiss timer; all queue-correct badge logic
@@ -23,18 +23,10 @@ lives in the pure ``feedback`` module.
 
 import threading
 import weakref
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
+from src.display import Displays
 from src.feedback import Badge, BadgeKind, Feedback
-
-# mss gives the actual display the attendee chose for screenshots.  NSScreen may
-# order displays differently, so we anchor the badge to the mss monitor.
-try:
-    import mss
-    _MSS_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    _MSS_AVAILABLE = False
-    mss = None  # type: ignore[assignment]
 
 # Import AppKit/ObjC at module load if present.  The implementations must still
 # be importable when they are absent, so any failure here is non-fatal.
@@ -176,8 +168,6 @@ if _APPKIT_AVAILABLE:
 class Hud(Protocol):
     """Collaborator interface for the on-screen feedback window."""
 
-    window_id: int | None
-
     def run(self) -> None:
         """Block the calling thread until stop() is called."""
         ...
@@ -318,7 +308,6 @@ class NullHud(_BaseHud):
 
     def __init__(self) -> None:
         super().__init__()
-        self.window_id: int | None = None
 
     def turn_started(self) -> None:
         """No-op in the null implementation."""
@@ -347,17 +336,22 @@ class HudPanel(_BaseHud):
     _PANEL_PADDING = 12
     _GLYPH_POINT_SIZE = 22.0
 
-    def __init__(self, monitor_index: int = 1, outcome_seconds: float = 1.5) -> None:
+    def __init__(
+        self,
+        *,
+        displays: Displays,
+        display_index: int,
+        outcome_seconds: float = 1.5,
+    ) -> None:
         super().__init__()
-        self._monitor_index = monitor_index
+        self._displays = displays
+        self._display_index = display_index
         self._outcome_seconds = outcome_seconds
-        self._monitor, self._main_height = self._load_geometry()
         self._feedback = Feedback()
         self._panel: Any | None = None
         self._label: Any | None = None
         self._bridge: Any | None = None
         self._outcome_timer: Any | None = None
-        self._window_id: int | None = None
 
         if self._appkit_available() and threading.current_thread() is threading.main_thread():
             try:
@@ -369,11 +363,6 @@ class HudPanel(_BaseHud):
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
-
-    @property
-    def window_id(self) -> int | None:
-        """Return the panel's cached window number, or None before it is created."""
-        return self._window_id
 
     def stop(self) -> None:
         """Signal the run loop to exit and clear the panel."""
@@ -488,55 +477,16 @@ class HudPanel(_BaseHud):
         except Exception:
             pass
 
-    def _load_geometry(self) -> tuple[Mapping[str, int] | None, int]:
-        """Return the selected mss monitor and the main display height.
-
-        The main display height is needed to convert mss top-left Quartz
-        coordinates into AppKit bottom-left coordinates.
-        """
-        if not _MSS_AVAILABLE or mss is None:
-            return None, 0
-
-        try:
-            with mss.MSS() as sct:
-                all_monitors = sct.monitors
-                if not all_monitors:
-                    return None, 0
-
-                if 0 <= self._monitor_index < len(all_monitors):
-                    selected = all_monitors[self._monitor_index]
-                else:
-                    selected = all_monitors[1] if len(all_monitors) > 1 else all_monitors[0]
-
-                physical = all_monitors[1:]
-                if physical:
-                    main = next(
-                        (m for m in physical if m.get("left") == 0 and m.get("top") == 0),
-                        physical[0],
-                    )
-                    main_height = main.get("height", selected.get("height", 0))
-                else:
-                    main_height = selected.get("height", 0)
-
-                return selected, main_height
-        except Exception:
-            return None, 0
-
     def _content_rect(self) -> Any:
         """Return the panel frame for the bottom-right of the chosen screen."""
-        monitor = self._monitor
-        if monitor is None:
-            x = float(self._PANEL_PADDING)
-            y = float(self._PANEL_PADDING)
-        else:
-            left = float(monitor.get("left", 0))
-            top = float(monitor.get("top", 0))
-            width = float(monitor.get("width", 0))
-            height = float(monitor.get("height", 0))
-
-            x = left + width - self._PANEL_SIZE - self._PANEL_PADDING
-            # Convert mss top-left Quartz coordinates to AppKit bottom-left.
-            y = -(top + height) + self._main_height + self._PANEL_PADDING
+        try:
+            x, y = self._displays.appkit_bottom_right(
+                self._display_index,
+                self._PANEL_SIZE,
+                self._PANEL_PADDING,
+            )
+        except Exception:
+            x, y = self._PANEL_PADDING, self._PANEL_PADDING
 
         return NSMakeRect(
             float(x),
@@ -599,7 +549,6 @@ class HudPanel(_BaseHud):
         panel.setContentView_(label)
         self._panel = panel
         self._label = label
-        self._window_id = panel.windowNumber()
 
     def _hide(self) -> None:
         """Hide the panel, if one exists."""
@@ -609,7 +558,6 @@ class HudPanel(_BaseHud):
         except Exception:
             self._panel = None
             self._label = None
-            self._window_id = None
 
     def _close_panel(self) -> None:
         """Close the panel and clear the cached references."""
@@ -621,4 +569,3 @@ class HudPanel(_BaseHud):
             pass
         self._panel = None
         self._label = None
-        self._window_id = None

@@ -1,21 +1,14 @@
-"""Tests for the audio module — chunk accumulation, silence detection, and restart logic.
-
-Tests inject fakes at the transcription and system-playback seams. Core queue
-cases still drive AudioThread._run_chunk_loop directly, without opening real
-capture hardware.
-"""
-
-import queue
 import threading
 import time
 from collections.abc import Callable
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
 from src.audio import (
-    AudioThread,
+    TranscriptIntake,
+    WhisperTranscriber,
     _SAMPLE_RATE,
     _SILENCE_RMS,
     _SILENCE_WARN_AFTER,
@@ -26,13 +19,44 @@ from src.system_playback import BlackHoleSource, default_system_playback_source
 from src.transcript import Transcript
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+class FakeSource:
+    description = "fake system playback"
+    silence_warning = "No audio detected on system playback."
+
+    def __init__(self, *, start_error: Exception | None = None) -> None:
+        self.start_count = 0
+        self.stop_count = 0
+        self.started = threading.Event()
+        self._start_error = start_error
+        self._on_block: Callable[[np.ndarray], None] | None = None
+        self._on_error: Callable[[Exception], None] | None = None
+
+    def prepare(self) -> None:
+        pass
+
+    def start(self, on_block, on_error) -> None:
+        self.start_count += 1
+        self._on_block = on_block
+        self._on_error = on_error
+        self.started.set()
+        if self._start_error is not None:
+            error = self._start_error
+            self._start_error = None
+            raise error
+
+    def emit(self, block: np.ndarray) -> None:
+        assert self._on_block is not None
+        self._on_block(block)
+
+    def fail(self, error: Exception) -> None:
+        assert self._on_error is not None
+        self._on_error(error)
+
+    def stop(self) -> None:
+        self.stop_count += 1
+
 
 class FakeTranscriber:
-    """Test double for Transcriber: records calls and returns fixed text."""
-
     def __init__(self, return_text: str = "hello world") -> None:
         self.calls: list[np.ndarray] = []
         self.return_text = return_text
@@ -64,437 +88,343 @@ class FakeScreenCaptureKitFramework:
         pass
 
 
-class FakeSystemPlaybackSource:
-    description = "fake system playback"
-    silence_warning = "No audio detected on system playback."
-
-    def __init__(self, *, stop_error: Exception | None = None) -> None:
-        self.started = threading.Event()
-        self.restarted = threading.Event()
-        self.final_stop = threading.Event()
-        self.start_count = 0
-        self.stop_count = 0
-        self.stop_error = stop_error
-        self.stopped = False
-        self._on_block: Callable[[np.ndarray], None] | None = None
-        self._on_error: Callable[[Exception], None] | None = None
-
-    def prepare(self) -> None:
-        pass
-
-    def start(self, on_block, on_error) -> None:
-        self._on_block = on_block
-        self._on_error = on_error
-        self.start_count += 1
-        self.started.set()
-        if self.start_count == 2:
-            self.restarted.set()
-
-    def emit(self, block: np.ndarray) -> None:
-        assert self._on_block is not None
-        self._on_block(block)
-
-    def fail(self, error: Exception) -> None:
-        assert self._on_error is not None
-        self._on_error(error)
-
-    def stop(self) -> None:
-        self.stopped = True
-        self.stop_count += 1
-        if self.stop_error is not None:
-            error = self.stop_error
-            self.stop_error = None
-            raise error
-        self.final_stop.set()
+def wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition was not met before timeout")
+        time.sleep(0.01)
 
 
-def _make_thread(tmp_path, transcriber=None, chunk_seconds: int = 1, source=None):
-    """Wire a minimal AudioThread with an in-memory Transcript and tmp Storage."""
+def make_intake(
+    tmp_path: Path,
+    *,
+    source=None,
+    transcriber=None,
+    warn: Callable[[str], None] | None = None,
+    log_path: Path | None = None,
+    restart_delay_seconds: float = 0.01,
+) -> tuple[TranscriptIntake, FakeSource | object, FakeTranscriber | object, Transcript, Storage]:
+    actual_source = source if source is not None else FakeSource()
+    actual_transcriber = transcriber if transcriber is not None else FakeTranscriber()
     transcript = Transcript()
-    storage = Storage(base_dir=tmp_path)
-    storage.start_meeting("test-audio", ["en"])
-    thread = AudioThread(
+    archive = Storage(base_dir=tmp_path)
+    archive.start_meeting("test-audio", ["en"])
+    intake = TranscriptIntake(
+        source=actual_source,
+        transcriber=actual_transcriber,
         transcript=transcript,
-        storage=storage,
-        source=source if source is not None else FakeSystemPlaybackSource(),
-        chunk_seconds=chunk_seconds,
+        archive=archive,
+        chunk_seconds=1,
+        log_path=log_path,
+        restart_delay_seconds=restart_delay_seconds,
+        warn=warn if warn is not None else (lambda _: None),
+    )
+    return intake, actual_source, actual_transcriber, transcript, archive
+
+
+def block(frames: int, amplitude: float = 0.1) -> np.ndarray:
+    return np.full(frames, amplitude, dtype=np.float32)
+
+
+def transcript_file(archive: Storage) -> str:
+    assert archive.meeting_dir is not None
+    return (archive.meeting_dir / "transcript.txt").read_text(encoding="utf-8")
+
+
+def intake_thread_stopped() -> bool:
+    return not any(thread.name == "TranscriptIntake" for thread in threading.enumerate())
+
+
+def test_playback_adapters_flow_into_transcript_and_archive(tmp_path, monkeypatch):
+    devices = [
+        {"name": "MacBook Air Microphone", "max_input_channels": 1},
+        {"name": "BlackHole 2ch", "max_input_channels": 2},
+    ]
+    started = threading.Event()
+    stream_callbacks = {}
+
+    class FakeInputStream:
+        def __init__(self, **kwargs) -> None:
+            stream_callbacks.update(kwargs)
+
+        def start(self) -> None:
+            started.set()
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setenv("HELPMEETING_AUDIO_SOURCE", "blackhole")
+    monkeypatch.setattr("src.system_playback.sd.query_devices", lambda: devices)
+    monkeypatch.setattr("src.system_playback.sd.InputStream", FakeInputStream)
+    source = default_system_playback_source()
+    assert isinstance(source, BlackHoleSource)
+    source.prepare()
+    transcriber = FakeTranscriber("captured speech")
+    intake, _, _, transcript, archive = make_intake(
+        tmp_path,
+        source=source,
         transcriber=transcriber,
     )
-    return thread, transcript, storage
 
-
-def _build_blocks(n_blocks: int, amplitude: float, block_size: int = 512) -> list[np.ndarray]:
-    """Return a list of mono float32 blocks with the given amplitude."""
-    return [np.full(block_size, amplitude, dtype="float32") for _ in range(n_blocks)]
-
-
-def _blocks_per_chunk(chunk_seconds: int = 1, block_size: int = 512) -> int:
-    """Return the minimum number of blocks to fill one complete chunk."""
-    return (_SAMPLE_RATE * chunk_seconds + block_size - 1) // block_size
-
-
-def _feed_and_run(thread: AudioThread, transcriber, blocks, *, join_timeout: float = 2.0) -> None:
-    """Pre-populate a queue, run _run_chunk_loop in a thread, then signal stop.
-
-    Sets stop_event after a brief pause so the loop has time to consume all
-    pre-loaded blocks before it exits.
-    """
-    q: queue.Queue = queue.Queue()
-    for block in blocks:
-        q.put(block)
-
-    runner = threading.Thread(
-        target=thread._run_chunk_loop, args=(q, transcriber), daemon=True
+    intake.start()
+    assert started.wait(timeout=1.0)
+    stream_callbacks["callback"](
+        np.full((_SAMPLE_RATE, 1), 0.1, dtype=np.float32),
+        _SAMPLE_RATE,
+        None,
+        None,
     )
-    runner.start()
-    # Give the loop time to start and consume queued blocks.
-    time.sleep(0.1)
-    thread._stop_event.set()
-    runner.join(timeout=join_timeout)
-    assert not runner.is_alive(), "chunk loop did not exit within timeout"
+    wait_for(lambda: len(transcriber.calls) == 1)
+    intake.stop()
+
+    assert transcript.take_delta() == "captured speech"
+    assert transcript_file(archive) == "captured speech"
 
 
-# ---------------------------------------------------------------------------
-# Playback source
-# ---------------------------------------------------------------------------
+def test_screencapturekit_source_flows_into_transcript_and_archive(tmp_path):
+    native_capture = FakeScreenCaptureKitFramework()
+    source = ScreenCaptureKitSource(framework=native_capture)
+    transcriber = FakeTranscriber("captured speech")
+    intake, _, _, transcript, archive = make_intake(
+        tmp_path,
+        source=source,
+        transcriber=transcriber,
+    )
 
-class TestSystemPlaybackSource:
-    def test_explicit_blackhole_source_grows_transcript_through_shared_transcription(
-        self, tmp_path, monkeypatch
-    ):
-        devices = [
-            {"name": "MacBook Air Microphone", "max_input_channels": 1},
-            {"name": "BlackHole 2ch", "max_input_channels": 2},
-        ]
-        started = threading.Event()
-        stream_callbacks = {}
+    intake.start()
+    assert native_capture.started.wait(timeout=1.0)
+    native_capture.emit(block(_SAMPLE_RATE))
+    wait_for(lambda: len(transcriber.calls) == 1)
+    intake.stop()
 
-        class FakeInputStream:
-            def __init__(self, **kwargs) -> None:
-                stream_callbacks.update(kwargs)
+    assert transcript.take_delta() == "captured speech"
+    assert transcript_file(archive) == "captured speech"
 
-            def start(self) -> None:
-                started.set()
 
-            def stop(self) -> None:
-                pass
+def test_blocks_accumulate_until_chunk_boundary_and_persist_text(tmp_path):
+    transcriber = FakeTranscriber("spoken text")
+    intake, source, _, transcript, archive = make_intake(tmp_path, transcriber=transcriber)
 
-            def close(self) -> None:
-                pass
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    first = block(_SAMPLE_RATE // 2)
+    second = block(_SAMPLE_RATE // 2)
+    source.emit(first)
+    assert transcriber.calls == []
+    source.emit(second)
+    wait_for(lambda: len(transcriber.calls) == 1)
+    intake.stop()
 
-        monkeypatch.setenv("HELPMEETING_AUDIO_SOURCE", "blackhole")
-        monkeypatch.setattr("src.system_playback.sd.query_devices", lambda: devices)
-        monkeypatch.setattr("src.system_playback.sd.InputStream", FakeInputStream)
-        source = default_system_playback_source()
-        assert isinstance(source, BlackHoleSource)
-        source.prepare()
-        transcriber = FakeTranscriber("captured speech")
-        thread, transcript, storage = _make_thread(tmp_path, transcriber, source=source)
+    assert np.array_equal(transcriber.calls[0], np.concatenate([first, second]))
+    assert transcript.take_delta() == "spoken text"
+    assert transcript_file(archive) == "spoken text"
 
-        thread.start()
-        assert started.wait(timeout=1.0)
-        stream_callbacks["callback"](
-            np.full((_SAMPLE_RATE, 1), 0.1, dtype="float32"), _SAMPLE_RATE, None, None
+
+def test_silent_chunks_warn_once_and_are_not_transcribed(tmp_path):
+    warnings: list[str] = []
+    log_path = tmp_path / "audio.log"
+    transcriber = FakeTranscriber()
+    intake, source, _, _, _ = make_intake(
+        tmp_path,
+        transcriber=transcriber,
+        warn=warnings.append,
+        log_path=log_path,
+    )
+
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    for _ in range(_SILENCE_WARN_AFTER + 1):
+        source.emit(block(_SAMPLE_RATE, amplitude=_SILENCE_RMS * 0.5))
+    wait_for(
+        lambda: f"chunk #{_SILENCE_WARN_AFTER + 1}:" in log_path.read_text(
+            encoding="utf-8"
         )
-        deadline = time.monotonic() + 1.0
-        while not transcriber.calls and time.monotonic() < deadline:
-            time.sleep(0.01)
-        thread.stop()
-
-        assert transcript.take_delta() == "captured speech"
-        transcript_path = storage.meeting_dir / "transcript.txt"
-        assert transcript_path.read_text(encoding="utf-8") == "captured speech"
-
-    def test_screencapturekit_source_grows_transcript_through_shared_transcription(self, tmp_path):
-        native_capture = FakeScreenCaptureKitFramework()
-        source = ScreenCaptureKitSource(framework=native_capture)
-        transcriber = FakeTranscriber("captured speech")
-        thread, transcript, storage = _make_thread(tmp_path, transcriber, source=source)
-
-        thread.start()
-        assert native_capture.started.wait(timeout=1.0)
-        native_capture.emit(np.full(_SAMPLE_RATE, 0.1, dtype="float32"))
-        deadline = time.monotonic() + 1.0
-        while not transcriber.calls and time.monotonic() < deadline:
-            time.sleep(0.01)
-        thread.stop()
-
-        assert transcript.take_delta() == "captured speech"
-        transcript_path = storage.meeting_dir / "transcript.txt"
-        assert transcript_path.read_text(encoding="utf-8") == "captured speech"
-
-    def test_source_blocks_flow_through_shared_transcription(self, tmp_path):
-        source = FakeSystemPlaybackSource()
-        transcriber = FakeTranscriber("spoken text")
-        transcript = Transcript()
-        storage = Storage(base_dir=tmp_path)
-        storage.start_meeting("test-audio", ["en"])
-        thread = AudioThread(
-            transcript=transcript,
-            storage=storage,
-            source=source,
-            chunk_seconds=1,
-            transcriber=transcriber,
-        )
-
-        thread.start()
-        assert source.started.wait(timeout=1.0)
-        source.emit(np.full(_SAMPLE_RATE, 0.1, dtype="float32"))
-        deadline = time.monotonic() + 1.0
-        while not transcriber.calls and time.monotonic() < deadline:
-            time.sleep(0.01)
-        thread.stop()
-
-        assert transcript.take_delta() == "spoken text"
-        assert source.stopped is True
-
-    def test_source_failure_uses_shared_restart_behavior(self, tmp_path):
-        source = FakeSystemPlaybackSource()
-        thread, _, _ = _make_thread(tmp_path, FakeTranscriber(), source=source)
-
-        with patch.object(thread._stop_event, "wait", return_value=True):
-            thread.start()
-            assert source.started.wait(timeout=1.0)
-            source.fail(RuntimeError("device disconnected"))
-            assert source.restarted.wait(timeout=1.0)
-            thread.stop()
-
-        assert source.start_count == 2
+    )
+    intake.stop()
+
+    assert len(warnings) == 1
+    assert source.silence_warning in warnings[0]
+    assert transcriber.calls == []
+
+
+def test_loud_chunk_resets_silence_warning(tmp_path):
+    warnings: list[str] = []
+    log_path = tmp_path / "audio.log"
+    transcriber = FakeTranscriber()
+    intake, source, _, _, _ = make_intake(
+        tmp_path,
+        transcriber=transcriber,
+        warn=warnings.append,
+        log_path=log_path,
+    )
+
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    for _ in range(_SILENCE_WARN_AFTER):
+        source.emit(block(_SAMPLE_RATE, amplitude=0.0))
+    wait_for(lambda: len(warnings) == 1)
+    source.emit(block(_SAMPLE_RATE))
+    wait_for(lambda: len(transcriber.calls) == 1)
+    for _ in range(_SILENCE_WARN_AFTER):
+        source.emit(block(_SAMPLE_RATE, amplitude=0.0))
+    wait_for(lambda: len(warnings) == 2)
+    intake.stop()
+
+    assert len(warnings) == 2
+
+
+def test_stop_flushes_partial_audio_and_joins_thread(tmp_path):
+    transcriber = FakeTranscriber("final words")
+    intake, source, _, transcript, archive = make_intake(
+        tmp_path,
+        transcriber=transcriber,
+    )
+
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    partial = block(_SAMPLE_RATE // 2)
+    source.emit(partial)
+    intake.stop()
+    wait_for(intake_thread_stopped)
+
+    assert len(transcriber.calls) == 1
+    assert np.array_equal(transcriber.calls[0], partial)
+    assert transcript.take_delta() == "final words"
+    assert transcript_file(archive) == "final words"
+    assert source.stop_count >= 1
+
+
+def test_stop_with_no_audio_does_not_transcribe(tmp_path):
+    transcriber = FakeTranscriber()
+    intake, source, _, _, _ = make_intake(tmp_path, transcriber=transcriber)
+
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    intake.stop()
+
+    assert transcriber.calls == []
+
+
+def test_empty_transcription_leaves_transcript_and_archive_empty(tmp_path):
+    transcriber = FakeTranscriber("")
+    intake, source, _, transcript, archive = make_intake(
+        tmp_path,
+        transcriber=transcriber,
+    )
+
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    source.emit(block(_SAMPLE_RATE))
+    wait_for(lambda: len(transcriber.calls) == 1)
+    intake.stop()
+
+    assert transcript.take_delta() == ""
+    assert transcript_file(archive) == ""
+
+
+def test_source_error_is_logged_warned_and_restarted(tmp_path):
+    warnings: list[str] = []
+    log_path = tmp_path / "audio.log"
+    intake, source, _, _, _ = make_intake(
+        tmp_path,
+        warn=warnings.append,
+        log_path=log_path,
+    )
+
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    source.fail(RuntimeError("device disconnected"))
+    wait_for(lambda: source.start_count == 2)
+    intake.stop()
+
+    log = log_path.read_text(encoding="utf-8")
+    assert any("restarting" in warning for warning in warnings)
+    assert "capture loop crashed" in log
+    assert "Traceback" in log
+    assert "device disconnected" in log
 
-    def test_clean_stop_flushes_the_final_partial_chunk(self, tmp_path):
-        source = FakeSystemPlaybackSource()
-        transcriber = FakeTranscriber("final words")
-        thread, transcript, _ = _make_thread(tmp_path, transcriber, source=source)
-
-        thread.start()
-        assert source.started.wait(timeout=1.0)
-        source.emit(np.full(_SAMPLE_RATE // 2, 0.1, dtype="float32"))
-        time.sleep(0.1)
-        thread.stop()
 
-        assert len(transcriber.calls) == 1
-        assert transcript.take_delta() == "final words"
+def test_source_start_error_retries_then_stops_cleanly(tmp_path):
+    source = FakeSource(start_error=RuntimeError("initial start failed"))
+    intake, _, _, _, _ = make_intake(tmp_path, source=source)
 
-    def test_stop_waits_for_final_flush_when_source_stop_raises(self, tmp_path):
-        source = FakeSystemPlaybackSource(stop_error=RuntimeError("stop failed"))
-        transcriber = FakeTranscriber("final words")
-        thread, transcript, _ = _make_thread(tmp_path, transcriber, source=source)
+    intake.start()
+    wait_for(lambda: source.start_count == 2)
+    intake.stop()
+    wait_for(intake_thread_stopped)
 
-        thread.start()
-        assert source.started.wait(timeout=1.0)
-        source.emit(np.full(_SAMPLE_RATE // 2, 0.1, dtype="float32"))
-        time.sleep(0.1)
-        with pytest.raises(RuntimeError, match="stop failed"):
-            thread.stop()
+    assert source.start_count == 2
 
-        assert source.final_stop.is_set()
-        assert transcript.take_delta() == "final words"
 
+def test_stop_interrupts_restart_wait(tmp_path):
+    warnings: list[str] = []
+    intake, source, _, _, _ = make_intake(
+        tmp_path,
+        warn=warnings.append,
+        restart_delay_seconds=5.0,
+    )
 
-# ---------------------------------------------------------------------------
-# Chunking
-# ---------------------------------------------------------------------------
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    source.fail(RuntimeError("device disconnected"))
+    wait_for(lambda: any("restarting" in warning for warning in warnings))
 
-class TestChunking:
-    """_run_chunk_loop accumulates blocks and triggers transcription at chunk boundaries."""
+    started_at = time.monotonic()
+    intake.stop()
 
-    def test_full_chunk_is_transcribed(self, tmp_path):
-        ft = FakeTranscriber("spoken text")
-        thread, transcript, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
+    assert time.monotonic() - started_at < 1.0
+    assert source.start_count == 1
 
-        n = _blocks_per_chunk()
-        blocks = _build_blocks(n, amplitude=0.1)  # well above _SILENCE_RMS
 
-        _feed_and_run(thread, ft, blocks)
+def test_error_delivered_after_stop_does_not_restart(tmp_path):
+    intake, source, _, _, _ = make_intake(tmp_path)
 
-        assert len(ft.calls) == 1
-        assert len(ft.calls[0]) >= _SAMPLE_RATE  # at least one second of audio
-        assert transcript._buffer == ["spoken text"]
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    intake.stop()
+    source.fail(RuntimeError("late callback"))
 
-    def test_two_full_chunks_trigger_two_transcription_calls(self, tmp_path):
-        ft = FakeTranscriber("chunk")
-        thread, transcript, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
+    assert source.start_count == 1
 
-        blocks = _build_blocks(_blocks_per_chunk() * 2, amplitude=0.1)
 
-        _feed_and_run(thread, ft, blocks)
+def test_queued_full_chunk_is_drained_when_stopping(tmp_path):
+    transcriber = FakeTranscriber("queued words")
+    intake, source, _, transcript, archive = make_intake(
+        tmp_path,
+        transcriber=transcriber,
+    )
 
-        assert len(ft.calls) == 2
-        assert transcript._buffer == ["chunk", "chunk"]
+    intake.start()
+    assert source.started.wait(timeout=1.0)
+    source.emit(block(_SAMPLE_RATE))
+    intake.stop()
 
-    def test_incomplete_chunk_is_not_transcribed(self, tmp_path):
-        ft = FakeTranscriber("text")
-        thread, transcript, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
+    assert len(transcriber.calls) == 1
+    assert transcript.take_delta() == "queued words"
+    assert transcript_file(archive) == "queued words"
 
-        # Feed only half a chunk's worth of blocks.
-        half = _blocks_per_chunk() // 2
-        blocks = _build_blocks(half, amplitude=0.1)
 
-        _feed_and_run(thread, ft, blocks)
+def test_whisper_model_is_loaded_lazily_and_only_once(monkeypatch):
+    constructions: list[tuple[tuple, dict]] = []
 
-        assert len(ft.calls) == 0
+    class FakeWhisperModel:
+        def __init__(self, *args, **kwargs) -> None:
+            constructions.append((args, kwargs))
 
-    def test_empty_transcription_is_not_appended(self, tmp_path):
-        ft = FakeTranscriber("")  # transcriber returns empty string
-        thread, transcript, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
+        def transcribe(self, _audio, **_kwargs):
+            return [SimpleNamespace(text="captured speech")], None
 
-        blocks = _build_blocks(_blocks_per_chunk(), amplitude=0.1)
+    monkeypatch.setattr("src.audio.WhisperModel", FakeWhisperModel)
+    logs: list[str] = []
+    transcriber = WhisperTranscriber("base", "en", log_fn=logs.append)
 
-        _feed_and_run(thread, ft, blocks)
+    assert constructions == []
+    assert transcriber.transcribe(block(1)) == "captured speech"
+    assert transcriber.transcribe(block(1)) == "captured speech"
 
-        assert len(ft.calls) == 1
-        assert transcript._buffer == []  # empty text must not be appended
-
-    def test_partial_blocks_accumulate_across_iterations(self, tmp_path):
-        """Verify accumulation works even when block boundaries don't align to chunk size."""
-        ft = FakeTranscriber("text")
-        thread, _, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
-
-        # Use odd block size that doesn't divide evenly into _SAMPLE_RATE
-        odd_block_size = 300
-        n_blocks = (_SAMPLE_RATE + odd_block_size - 1) // odd_block_size + 1
-        blocks = [np.full(odd_block_size, 0.1, dtype="float32") for _ in range(n_blocks)]
-
-        _feed_and_run(thread, ft, blocks)
-
-        assert len(ft.calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# Silence detection
-# ---------------------------------------------------------------------------
-
-class TestSilenceDetection:
-    """Silent chunks (rms < _SILENCE_RMS) are skipped; a warning is printed once."""
-
-    def test_silent_chunk_is_not_transcribed(self, tmp_path):
-        ft = FakeTranscriber("text")
-        thread, transcript, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
-
-        blocks = _build_blocks(_blocks_per_chunk(), amplitude=0.0)  # pure silence
-
-        _feed_and_run(thread, ft, blocks)
-
-        assert len(ft.calls) == 0
-
-    def test_silence_warning_printed_after_threshold(self, tmp_path, capsys):
-        ft = FakeTranscriber()
-        thread, _, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
-
-        # Feed enough silent chunks to exceed _SILENCE_WARN_AFTER.
-        n = _blocks_per_chunk() * (_SILENCE_WARN_AFTER + 1)
-        blocks = _build_blocks(n, amplitude=0.0)
-
-        _feed_and_run(thread, ft, blocks, join_timeout=3.0)
-
-        captured = capsys.readouterr()
-        assert "No audio detected" in captured.out
-
-    def test_silence_warning_printed_only_once(self, tmp_path, capsys):
-        ft = FakeTranscriber()
-        thread, _, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
-
-        n = _blocks_per_chunk() * (_SILENCE_WARN_AFTER + 5)
-        blocks = _build_blocks(n, amplitude=0.0)
-
-        _feed_and_run(thread, ft, blocks, join_timeout=3.0)
-
-        captured = capsys.readouterr()
-        assert captured.out.count("No audio detected") == 1
-
-    def test_loud_chunk_after_silence_resets_counter(self, tmp_path):
-        """One silent chunk followed by a loud chunk: only the loud chunk is transcribed."""
-        ft = FakeTranscriber("hello")
-        thread, transcript, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
-
-        n = _blocks_per_chunk()
-        silent = _build_blocks(n, amplitude=0.0)
-        loud = _build_blocks(n, amplitude=0.5)
-
-        _feed_and_run(thread, ft, silent + loud, join_timeout=3.0)
-
-        assert len(ft.calls) == 1
-
-    def test_just_below_silence_threshold_not_transcribed(self, tmp_path):
-        """Amplitude just under _SILENCE_RMS triggers silence path."""
-        ft = FakeTranscriber("text")
-        thread, _, _ = _make_thread(tmp_path, ft, chunk_seconds=1)
-
-        # _SILENCE_RMS is the RMS threshold; use amplitude slightly below it.
-        below = float(_SILENCE_RMS) * 0.5
-        blocks = _build_blocks(_blocks_per_chunk(), amplitude=below)
-
-        _feed_and_run(thread, ft, blocks)
-
-        assert len(ft.calls) == 0
-
-
-# ---------------------------------------------------------------------------
-# Restart-on-error
-# ---------------------------------------------------------------------------
-
-class TestRestartOnError:
-    """_run_with_restart catches exceptions from _capture_loop and retries."""
-
-    def test_restarts_after_capture_loop_exception(self, tmp_path):
-        thread, _, _ = _make_thread(tmp_path, FakeTranscriber())
-        call_log: list[str] = []
-
-        def fake_capture_loop():
-            call_log.append("call")
-            if len(call_log) == 1:
-                raise RuntimeError("device disconnected")
-            thread._stop_event.set()  # allow exit on second call
-
-        thread._capture_loop = fake_capture_loop
-
-        with patch("time.sleep"):  # skip the 2-second restart delay
-            thread._run_with_restart()
-
-        assert call_log.count("call") == 2
-
-    def test_does_not_restart_when_stop_event_set_on_error(self, tmp_path):
-        """If stop_event is set before the exception propagates, no restart occurs."""
-        thread, _, _ = _make_thread(tmp_path, FakeTranscriber())
-        call_log: list[str] = []
-
-        def fake_capture_loop():
-            call_log.append("call")
-            thread._stop_event.set()
-            raise RuntimeError("device disconnected")
-
-        thread._capture_loop = fake_capture_loop
-
-        with patch("time.sleep"):
-            thread._run_with_restart()
-
-        assert call_log.count("call") == 1
-
-    def test_does_not_run_when_stop_event_already_set(self, tmp_path):
-        """_run_with_restart exits immediately if stop_event is set at entry."""
-        thread, _, _ = _make_thread(tmp_path, FakeTranscriber())
-        thread._stop_event.set()
-        call_log: list[str] = []
-        thread._capture_loop = lambda: call_log.append("call")
-
-        thread._run_with_restart()
-
-        assert call_log == []
-
-    def test_multiple_restarts_until_stop_event(self, tmp_path):
-        """_run_with_restart keeps retrying until stop_event is set."""
-        thread, _, _ = _make_thread(tmp_path, FakeTranscriber())
-        call_log: list[str] = []
-
-        def fake_capture_loop():
-            call_log.append("call")
-            if len(call_log) < 4:
-                raise RuntimeError("transient error")
-            thread._stop_event.set()
-
-        thread._capture_loop = fake_capture_loop
-
-        with patch("time.sleep"):
-            thread._run_with_restart()
-
-        assert call_log.count("call") == 4
+    assert len(constructions) == 1
+    assert logs == ["loading Whisper model…", "Whisper model loaded"]

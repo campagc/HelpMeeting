@@ -16,6 +16,12 @@ _Avoid_: Session, call, talk
 **Transcript**:
 The cumulative text of everything spoken in the meeting so far.
 
+**Transcript intake**:
+The module that turns system playback into transcript. It listens to one playback
+source, transcribes in fixed-length chunks, appends the text to the transcript and the
+archive, and restarts itself if the source fails. Its only seam is the playback source.
+_Avoid_: Audio thread, recorder, listener
+
 **Delta**:
 The stretch of transcript that has accumulated since the previous turn. Reading a delta
 consumes it — the next delta starts where this one ended.
@@ -25,6 +31,12 @@ _Avoid_: New speech, increment, diff
 A screenshot of the chosen display at the moment the attendee asked for help. Named for
 intent, not content — it is a slide even if the screen shows a whiteboard or a demo.
 _Avoid_: Screenshot, capture, frame
+
+**Display**:
+One physical screen, numbered from 1 in the order the system reports them. The attendee
+chooses one at startup; the slide is grabbed from it and the HUD is anchored to it. The
+Display module alone knows screen geometry and coordinate systems.
+_Avoid_: Monitor, screen (as a noun), mss index
 
 ### Asking for help
 
